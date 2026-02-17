@@ -197,6 +197,55 @@ def fast_count_files(
     return count, size
 
 
+def estimate_dir_size(
+    directory: Path,
+    ext: str,
+    sample_size: int = 50,
+    recursive: bool = False,
+) -> tuple[int, int, bool]:
+    """
+    Count matching files and estimate total size via sampling.
+
+    Iterates all directory entries (cheap readdir) but limits stat() calls
+    to sample_size files. Remaining file sizes are extrapolated from the
+    sampled average. For directories with fewer matching files than
+    sample_size, the returned size is exact.
+
+    Returns (file_count, estimated_size_bytes, is_estimated).
+    """
+    count = 0
+    sampled_sizes = []
+
+    def _scan(path: str) -> None:
+        nonlocal count
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False) and entry.name.endswith(ext):
+                        count += 1
+                        if len(sampled_sizes) < sample_size:
+                            try:
+                                sampled_sizes.append(entry.stat(follow_symlinks=False).st_size)
+                            except OSError:
+                                pass
+                    elif recursive and entry.is_dir(follow_symlinks=False):
+                        _scan(entry.path)
+        except PermissionError:
+            pass
+
+    _scan(str(directory))
+
+    if not sampled_sizes:
+        return count, 0, False
+    if count <= len(sampled_sizes):
+        return count, sum(sampled_sizes), False
+
+    avg_size = sum(sampled_sizes) / len(sampled_sizes)
+    exact_portion = sum(sampled_sizes)
+    estimated_portion = int(avg_size * (count - len(sampled_sizes)))
+    return count, exact_portion + estimated_portion, True
+
+
 def classify_fast5_by_size(fast5_file: Path) -> str:
     """
     Determine if a fast5 file is single-read or multi-read based on file size.
@@ -399,7 +448,15 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
             fast5_info["sampled_file"] = sample_file.name
 
             if classification == "single_read_fast5":
-                # Single-read fast5 — skip file counting (too many files)
+                if not quick:
+                    counts = [estimate_dir_size(d, ".fast5", recursive=True) for d in all_fast5_dirs]
+                    total_count = sum(c for c, _, _ in counts)
+                    total_size = sum(s for _, s, _ in counts)
+                    is_estimated = any(e for _, _, e in counts)
+                    fast5_info["file_count"] = total_count
+                    fast5_info["data_size_bytes"] = total_size
+                    if is_estimated:
+                        fast5_info["size_estimated"] = True
                 if has_numeric_subdirs:
                     fast5_info["note"] = "fast5/ contains numeric subdirs with single-read files"
                 else:
@@ -501,6 +558,14 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
                 "layout": "root" if fast5_in_root else "numeric_subdirs",
                 "size_based_classification": True,
             }
+            if not quick and classification == "single_read_fast5":
+                count, size, is_estimated = estimate_dir_size(
+                    run_path, ".fast5", recursive=True
+                )
+                fast5_info["file_count"] = count
+                fast5_info["data_size_bytes"] = size
+                if is_estimated:
+                    fast5_info["size_estimated"] = True
 
             if classification in ("single_read_fast5", "multi_read_fast5"):
                 result["formats"].append(classification)
@@ -802,6 +867,8 @@ def main():
 
         count_str = " / ".join(file_counts) if file_counts else "-"
         size_str = format_size(result["total_size_bytes"]) if "total_size_bytes" in result else "-"
+        if any(d.get("size_estimated") for d in result["details"].values()):
+            size_str = "~" + size_str
 
         # For unknown/permission_denied runs, show a brief reason even in non-verbose mode
         if "unknown" in result["formats"] or "permission_denied" in result["formats"]:
@@ -834,7 +901,8 @@ def main():
                         for a in detail["archive_files"]:
                             print(f"  +-- {a}")
                     if "data_size_bytes" in detail:
-                        print(f"  data size: {format_size(detail['data_size_bytes'])}")
+                        prefix = "~" if detail.get("size_estimated") else ""
+                        print(f"  data size: {prefix}{format_size(detail['data_size_bytes'])}")
                     if "note" in detail:
                         print(f"  note: {detail['note']}")
                     print_conversion_help(fmt)

@@ -20,6 +20,7 @@ from nanopore_format_checker import (
     compute_dir_size,
     diagnose_unknown,
     discover_run_structure,
+    estimate_dir_size,
     fast_count_files,
     find_named_subdirs,
     format_size,
@@ -471,6 +472,86 @@ def test_data_size_summing(tmp_path: Path) -> None:
     print("  PASS: data_size_bytes summing")
 
 
+def test_estimate_dir_size_exact(tmp_path: Path) -> None:
+    """Few files -- count and size should be exact (no estimation)."""
+    d = tmp_path / "20240101_run_est_exact" / "data"
+    d.mkdir(parents=True)
+    make_file(d / "a.fast5", size=100)
+    make_file(d / "b.fast5", size=200)
+    make_file(d / "c.txt", size=999)  # should not match
+
+    count, size, is_estimated = estimate_dir_size(d, ".fast5")
+    assert count == 2, f"Expected count=2, got {count}"
+    assert size == 300, f"Expected size=300, got {size}"
+    assert not is_estimated, "Should be exact, not estimated"
+    print("  PASS: estimate_dir_size exact")
+
+
+def test_estimate_dir_size_estimated(tmp_path: Path) -> None:
+    """More files than sample_size -- size should be estimated."""
+    d = tmp_path / "20240101_run_est_sampled" / "data"
+    d.mkdir(parents=True)
+    file_size = 500
+    num_files = 20
+    for i in range(num_files):
+        make_file(d / f"read_{i:04d}.fast5", size=file_size)
+
+    count, size, is_estimated = estimate_dir_size(d, ".fast5", sample_size=5)
+    assert count == num_files, f"Expected count={num_files}, got {count}"
+    assert is_estimated, "Should be estimated with sample_size=5"
+    # All files are the same size, so the estimate should be exact
+    assert size == num_files * file_size, f"Expected {num_files * file_size}, got {size}"
+    print("  PASS: estimate_dir_size estimated")
+
+
+def test_estimate_dir_size_recursive(tmp_path: Path) -> None:
+    """Files in subdirectories -- recursive counting."""
+    base = tmp_path / "20240101_run_est_rec" / "data"
+    (base / "sub1").mkdir(parents=True)
+    (base / "sub2").mkdir(parents=True)
+    make_file(base / "a.fast5", size=100)
+    make_file(base / "sub1" / "b.fast5", size=200)
+    make_file(base / "sub2" / "c.fast5", size=300)
+
+    count, size, is_estimated = estimate_dir_size(base, ".fast5", recursive=True)
+    assert count == 3, f"Expected count=3, got {count}"
+    assert size == 600, f"Expected size=600, got {size}"
+    assert not is_estimated, "Should be exact with only 3 files"
+    print("  PASS: estimate_dir_size recursive")
+
+
+def test_single_read_fast5_has_size(tmp_path: Path) -> None:
+    """Single-read fast5 in fast5/ should report data_size_bytes."""
+    run = tmp_path / "20240101_run_sf5_size"
+    (run / "fast5").mkdir(parents=True)
+    for i in range(10):
+        make_file(run / "fast5" / f"read_{i:04d}.fast5", size=30_000)
+
+    result = analyze_run(run)
+    assert "single_read_fast5" in result["formats"]
+    detail = result["details"]["single_read_fast5"]
+    assert "data_size_bytes" in detail, f"Missing data_size_bytes: {detail}"
+    assert detail["file_count"] == 10, f"Expected 10, got {detail.get('file_count')}"
+    assert detail["data_size_bytes"] == 300_000, f"Expected 300000, got {detail['data_size_bytes']}"
+    print("  PASS: single_read_fast5 in fast5/ has size")
+
+
+def test_single_read_fast5_root_has_size(tmp_path: Path) -> None:
+    """Single-read fast5 in root should report data_size_bytes."""
+    run = tmp_path / "20240101_run_sf5_root_size"
+    run.mkdir(parents=True)
+    for i in range(10):
+        make_file(run / f"read_{i:04d}.fast5", size=30_000)
+
+    result = analyze_run(run)
+    assert "single_read_fast5" in result["formats"]
+    detail = result["details"]["single_read_fast5"]
+    assert "data_size_bytes" in detail, f"Missing data_size_bytes: {detail}"
+    assert detail["file_count"] == 10, f"Expected 10, got {detail.get('file_count')}"
+    assert detail["data_size_bytes"] == 300_000, f"Expected 300000, got {detail['data_size_bytes']}"
+    print("  PASS: single_read_fast5 in root has size")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -507,6 +588,11 @@ def main():
         test_has_file_with_ext_budget,
         test_diagnose_unknown_capped,
         test_data_size_summing,
+        test_estimate_dir_size_exact,
+        test_estimate_dir_size_estimated,
+        test_estimate_dir_size_recursive,
+        test_single_read_fast5_has_size,
+        test_single_read_fast5_root_has_size,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:
