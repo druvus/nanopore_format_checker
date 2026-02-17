@@ -34,26 +34,96 @@ def is_nanopore_run_dir(dirname: str) -> bool:
     return bool(re.match(r"^\d{8}_", dirname))
 
 
-def find_subdirs(run_path: Path, target_name: str, max_depth: int = 2) -> list[Path]:
-    """Find subdirectories matching target_name up to max_depth levels down."""
+def find_named_subdirs(
+    run_path: Path,
+    name: str | None = None,
+    prefix: str | None = None,
+    max_depth: int = 2,
+) -> list[Path]:
+    """
+    Find subdirectories by exact name or prefix using os.scandir.
+
+    Only descends into directories, skipping all files at every level.
+    This avoids enumerating large numbers of files (100k+ in single-read
+    fast5 directories) that glob-based approaches would touch.
+    """
     matches = []
-    for depth in range(1, max_depth + 1):
-        pattern = "/".join(["*"] * depth)
-        for p in run_path.glob(pattern):
-            if p.is_dir() and p.name == target_name:
-                matches.append(p)
+
+    def _walk(directory: str, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            with os.scandir(directory) as it:
+                for entry in it:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    if name is not None and entry.name == name:
+                        matches.append(Path(entry.path))
+                    elif prefix is not None and entry.name.startswith(prefix):
+                        matches.append(Path(entry.path))
+                    _walk(entry.path, depth + 1)
+        except PermissionError:
+            pass
+
+    _walk(str(run_path), 1)
     return matches
 
 
-def find_subdirs_prefix(run_path: Path, prefix: str, max_depth: int = 3) -> list[Path]:
-    """Find subdirectories whose name starts with prefix, up to max_depth levels down."""
-    matches = []
-    for depth in range(1, max_depth + 1):
-        pattern = "/".join(["*"] * depth)
-        for p in run_path.glob(pattern):
-            if p.is_dir() and p.name.startswith(prefix):
-                matches.append(p)
-    return matches
+def discover_run_structure(run_path: Path, max_depth: int = 5) -> dict[str, list[Path]]:
+    """
+    Walk the run directory tree once and categorize all format-related subdirectories.
+
+    Returns a dict with keys:
+        "pod5"         - directories named exactly "pod5"
+        "pod5_prefix"  - directories starting with "pod5_" (pod5_pass, pod5_fail, etc.)
+        "fast5"        - directories named exactly "fast5"
+        "fast5_prefix" - directories starting with "fast5_" (fast5_pass, fast5_fail, etc.)
+        "fastq_prefix" - directories starting with "fastq" (fastq_pass, fastq_fail, etc.)
+    """
+    result = {
+        "pod5": [],
+        "pod5_prefix": [],
+        "fast5": [],
+        "fast5_prefix": [],
+        "fastq_prefix": [],
+    }
+
+    def _walk(directory: str, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            with os.scandir(directory) as it:
+                for entry in it:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    name = entry.name
+                    path = Path(entry.path)
+                    if name == "pod5":
+                        result["pod5"].append(path)
+                    elif name.startswith("pod5_"):
+                        result["pod5_prefix"].append(path)
+                    elif name == "fast5":
+                        result["fast5"].append(path)
+                    elif name.startswith("fast5_"):
+                        result["fast5_prefix"].append(path)
+                    elif name.startswith("fastq"):
+                        result["fastq_prefix"].append(path)
+                    _walk(entry.path, depth + 1)
+        except PermissionError:
+            pass
+
+    _walk(str(run_path), 1)
+    return result
+
+
+def _is_dir_readable(directory: Path) -> bool:
+    """Check if a directory is readable without enumerating its contents."""
+    try:
+        with os.scandir(directory) as it:
+            next(it, None)
+        return True
+    except PermissionError:
+        return False
 
 
 def find_files_with_ext(directory: Path, ext: str, limit: int = 5) -> list[Path]:
@@ -70,24 +140,49 @@ def find_files_with_ext(directory: Path, ext: str, limit: int = 5) -> list[Path]
     return found
 
 
-def fast_count_files(directory: Path, ext: str, recursive: bool = False) -> int:
+def fast_count_files(
+    directory: Path,
+    ext: str | None = None,
+    recursive: bool = False,
+    extensions: tuple[str, ...] | None = None,
+) -> tuple[int, int]:
     """
-    Count files with given extension using os.scandir for speed.
-    For large directories (100k+ single-read fast5), this is much faster
-    than Path.rglob or Path.iterdir with stat calls.
-    Supports compound extensions like .fastq.gz.
+    Count files matching extension(s) using os.scandir for speed.
+
+    Accepts either a single ext (".fast5") or a tuple of extensions
+    (".fastq", ".fastq.gz", ".fq", ".fq.gz") for single-pass counting.
+
+    Returns (file_count, total_size_bytes). The size is accumulated from
+    stat info that is already cached by the OS after the is_file() check.
     """
     count = 0
+    size = 0
     try:
         with os.scandir(directory) as it:
             for entry in it:
-                if entry.is_file(follow_symlinks=False) and entry.name.endswith(ext):
-                    count += 1
+                if entry.is_file(follow_symlinks=False):
+                    matched = False
+                    if ext is not None and entry.name.endswith(ext):
+                        matched = True
+                    elif extensions is not None and any(
+                        entry.name.endswith(e) for e in extensions
+                    ):
+                        matched = True
+                    if matched:
+                        count += 1
+                        try:
+                            size += entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            pass
                 elif recursive and entry.is_dir(follow_symlinks=False):
-                    count += fast_count_files(Path(entry.path), ext, recursive=True)
+                    sub_count, sub_size = fast_count_files(
+                        Path(entry.path), ext=ext, recursive=True, extensions=extensions
+                    )
+                    count += sub_count
+                    size += sub_size
     except PermissionError:
         pass
-    return count
+    return count, size
 
 
 def classify_fast5_by_size(fast5_file: Path) -> str:
@@ -120,14 +215,54 @@ def classify_fast5(fast5_file: Path) -> str:
     return classify_fast5_by_size(fast5_file)
 
 
-def count_files_recursive(directory: Path, ext: str) -> int:
-    """Count files with given extension recursively using fast os.scandir."""
+def count_files_recursive(directory: Path, ext: str) -> tuple[int, int]:
+    """Count files with given extension recursively using fast os.scandir.
+
+    Returns (file_count, total_size_bytes).
+    """
     return fast_count_files(directory, ext, recursive=True)
 
 
-def analyze_run(run_path: Path) -> dict:
+def compute_dir_size(directory: Path) -> int:
+    """Recursively sum the size of all files in a directory tree via os.scandir."""
+    total = 0
+
+    def _walk(path: str) -> None:
+        nonlocal total
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False):
+                        try:
+                            total += entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            pass
+                    elif entry.is_dir(follow_symlinks=False):
+                        _walk(entry.path)
+        except PermissionError:
+            pass
+
+    _walk(str(directory))
+    return total
+
+
+def format_size(size_bytes: int) -> str:
+    """Format a byte count as a human-readable string (e.g. '1.2 GB')."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        size_bytes /= 1024
+        if size_bytes < 1024 or unit == "TB":
+            return f"{size_bytes:.1f} {unit}"
+    return f"{size_bytes:.1f} TB"
+
+
+def analyze_run(run_path: Path, quick: bool = False) -> dict:
     """
     Analyze a nanopore run directory and determine its read format(s).
+
+    When quick=True, skip file counting and size calculation -- only report
+    the detected format(s).
 
     Detection logic:
         - pod5:             pod5/ subfolder 1-2 levels down
@@ -142,9 +277,15 @@ def analyze_run(run_path: Path) -> dict:
     result = {"formats": [], "details": {}}
 
     # --- Check permissions on run directory and its subdirectories ---
+    # Use os.scandir to extract only subdirectories, skipping all files.
+    # This avoids materializing 100k+ Path objects in single-read fast5 dirs.
     permission_errors = []
+    subdirs = []
     try:
-        contents = list(run_path.iterdir())
+        with os.scandir(run_path) as it:
+            for entry in it:
+                if entry.is_dir(follow_symlinks=False):
+                    subdirs.append(Path(entry.path))
     except PermissionError:
         result["formats"].append("permission_denied")
         result["details"]["permission_denied"] = {
@@ -152,16 +293,12 @@ def analyze_run(run_path: Path) -> dict:
         }
         return result
 
-    subdirs = [c for c in contents if c.is_dir()]
     for sd in subdirs:
-        try:
-            list(sd.iterdir())
-        except PermissionError:
+        if not _is_dir_readable(sd):
             permission_errors.append(sd.name)
 
     if permission_errors and not any(
-        # Check if at least some subdirs are readable
-        sd.name not in permission_errors for sd in subdirs if sd.is_dir()
+        sd.name not in permission_errors for sd in subdirs
     ):
         # ALL subdirectories are unreadable
         result["formats"].append("permission_denied")
@@ -171,45 +308,41 @@ def analyze_run(run_path: Path) -> dict:
         }
         return result
 
-    # --- Check for pod5 (pod5/ or pod5_pass/pod5_fail/pod5_skip, up to 3 levels down) ---
-    pod5_dirs = find_subdirs(run_path, "pod5", max_depth=5)
-    pod5_variant_dirs = find_subdirs_prefix(run_path, "pod5_", max_depth=5)
+    # --- Single-pass directory discovery ---
+    structure = discover_run_structure(run_path)
+    pod5_dirs = structure["pod5"]
+    pod5_variant_dirs = structure["pod5_prefix"]
+    fast5_dirs = structure["fast5"]
+    fast5_variant_dirs = structure["fast5_prefix"]
+    fastq_dirs = structure["fastq_prefix"]
+
+    # --- Check for pod5 (pod5/ or pod5_pass/pod5_fail/pod5_skip, up to 5 levels down) ---
     all_pod5_dirs = pod5_dirs + pod5_variant_dirs
     if all_pod5_dirs:
-        total_pod5 = sum(count_files_recursive(d, ".pod5") for d in all_pod5_dirs)
         variant_names = sorted(set(d.name for d in all_pod5_dirs))
-        # Check if directories are readable
-        unreadable_pod5 = []
-        for d in all_pod5_dirs:
-            try:
-                list(d.iterdir())
-            except PermissionError:
-                unreadable_pod5.append(str(d))
+        unreadable_pod5 = [str(d) for d in all_pod5_dirs if not _is_dir_readable(d)]
         pod5_detail = {
             "directories": [str(d) for d in all_pod5_dirs],
             "folder_variants": variant_names,
-            "file_count": total_pod5,
         }
+        if not quick:
+            counts = [count_files_recursive(d, ".pod5") for d in all_pod5_dirs]
+            total_pod5 = sum(c for c, _ in counts)
+            total_pod5_size = sum(s for _, s in counts)
+            pod5_detail["file_count"] = total_pod5
+            pod5_detail["data_size_bytes"] = total_pod5_size
         if unreadable_pod5:
             pod5_detail["note"] = f"Permission denied on {len(unreadable_pod5)} pod5 dir(s)"
             pod5_detail["inaccessible_dirs"] = unreadable_pod5
-        elif total_pod5 == 0:
+        elif not quick and total_pod5 == 0:
             pod5_detail["note"] = "Empty pod5 folder(s) found"
         result["formats"].append("pod5")
         result["details"]["pod5"] = pod5_detail
 
     # --- Check for fast5 (fast5/ or fast5_skip/fast5_pass/fast5_fail, up to 5 levels down) ---
-    fast5_dirs = find_subdirs(run_path, "fast5", max_depth=5)
-    fast5_variant_dirs = find_subdirs_prefix(run_path, "fast5_", max_depth=5)
     all_fast5_dirs = fast5_dirs + fast5_variant_dirs
     if all_fast5_dirs:
-        # Check which directories are readable
-        unreadable_fast5 = []
-        for d in all_fast5_dirs:
-            try:
-                list(d.iterdir())
-            except PermissionError:
-                unreadable_fast5.append(str(d))
+        unreadable_fast5 = [str(d) for d in all_fast5_dirs if not _is_dir_readable(d)]
 
         # Sample a fast5 file using os.scandir — also peek into numeric subdirs (0/, 1/, ...)
         sample_file = None
@@ -262,9 +395,13 @@ def analyze_run(run_path: Path) -> dict:
                 result["formats"].append("single_read_fast5")
                 result["details"]["single_read_fast5"] = fast5_info
             elif classification == "multi_read_fast5":
-                # Multi-read — count is fast (few large files)
-                total_fast5 = sum(count_files_recursive(d, ".fast5") for d in all_fast5_dirs)
-                fast5_info["file_count"] = total_fast5
+                # Multi-read -- count is fast (few large files)
+                if not quick:
+                    counts = [count_files_recursive(d, ".fast5") for d in all_fast5_dirs]
+                    total_fast5 = sum(c for c, _ in counts)
+                    total_fast5_size = sum(s for _, s in counts)
+                    fast5_info["file_count"] = total_fast5
+                    fast5_info["data_size_bytes"] = total_fast5_size
                 result["formats"].append("multi_read_fast5")
                 result["details"]["multi_read_fast5"] = fast5_info
             else:
@@ -283,30 +420,25 @@ def analyze_run(run_path: Path) -> dict:
             result["formats"].append("fast5_unknown")
             result["details"]["fast5_unknown"] = fast5_info
 
-    # --- Check for fastq (fastq_pass/fastq_fail, up to 3 levels down) ---
-    fastq_dirs = find_subdirs_prefix(run_path, "fastq", max_depth=5)
+    # --- Check for fastq (fastq_pass/fastq_fail, up to 5 levels down) ---
     if fastq_dirs:
-        total_fastq = 0
-        unreadable_fastq = []
-        for d in fastq_dirs:
-            try:
-                list(d.iterdir())
-            except PermissionError:
-                unreadable_fastq.append(str(d))
-            total_fastq += count_files_recursive(d, ".fastq")
-            total_fastq += count_files_recursive(d, ".fastq.gz")
-            total_fastq += count_files_recursive(d, ".fq")
-            total_fastq += count_files_recursive(d, ".fq.gz")
+        unreadable_fastq = [str(d) for d in fastq_dirs if not _is_dir_readable(d)]
         variant_names = sorted(set(d.name for d in fastq_dirs))
         fastq_detail = {
             "directories": [str(d) for d in fastq_dirs],
             "folder_variants": variant_names,
-            "file_count": total_fastq,
         }
+        if not quick:
+            _fastq_exts = (".fastq", ".fastq.gz", ".fq", ".fq.gz")
+            counts = [fast_count_files(d, extensions=_fastq_exts, recursive=True) for d in fastq_dirs]
+            total_fastq = sum(c for c, _ in counts)
+            total_fastq_size = sum(s for _, s in counts)
+            fastq_detail["file_count"] = total_fastq
+            fastq_detail["data_size_bytes"] = total_fastq_size
         if unreadable_fastq:
             fastq_detail["note"] = f"Permission denied on {len(unreadable_fastq)} fastq dir(s)"
             fastq_detail["inaccessible_dirs"] = unreadable_fastq
-        elif total_fastq == 0:
+        elif not quick and total_fastq == 0:
             fastq_detail["note"] = "Empty fastq folder(s) found"
         result["formats"].append("fastq")
         result["details"]["fastq"] = fastq_detail
@@ -365,14 +497,17 @@ def analyze_run(run_path: Path) -> dict:
                 result["formats"].append("fast5_unknown")
                 result["details"]["fast5_unknown"] = fast5_info
 
-    # --- Check for compressed archives (tar, gz, tar.gz) → treat as single_read_fast5 ---
+    # --- Check for compressed archives (tar, gz, tar.gz) -- treat as single_read_fast5 ---
     if not fast5_dirs and "single_read_fast5" not in result["formats"]:
         archive_exts = (".tar", ".gz", ".tar.gz", ".tgz")
         archives = []
         try:
-            for f in run_path.iterdir():
-                if f.is_file() and any(f.name.endswith(ext) for ext in archive_exts):
-                    archives.append(f)
+            with os.scandir(run_path) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False) and any(
+                        entry.name.endswith(ext) for ext in archive_exts
+                    ):
+                        archives.append(Path(entry.path))
         except PermissionError:
             pass
 
@@ -395,60 +530,77 @@ def analyze_run(run_path: Path) -> dict:
     return result
 
 
+def _has_file_with_ext(directory: Path, ext: str, max_depth: int = 5) -> bool:
+    """Check if any file with the given extension exists, with depth limit and early exit."""
+    def _search(path: str, depth: int) -> bool:
+        if depth > max_depth:
+            return False
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    if entry.is_file(follow_symlinks=False) and entry.name.endswith(ext):
+                        return True
+                    if entry.is_dir(follow_symlinks=False) and _search(entry.path, depth + 1):
+                        return True
+        except PermissionError:
+            pass
+        return False
+    return _search(str(directory), 1)
+
+
 def diagnose_unknown(run_path: Path) -> dict:
     """Gather diagnostic info for a run directory that matched no known format."""
     diag = {"reasons": []}
 
+    # Separate files and directories in a single os.scandir pass
+    subdirs = []
+    file_count = 0
+    extensions = {}
     try:
-        contents = list(run_path.iterdir())
+        with os.scandir(run_path) as it:
+            for entry in it:
+                if entry.is_dir(follow_symlinks=False):
+                    subdirs.append(entry.name)
+                elif entry.is_file(follow_symlinks=False):
+                    file_count += 1
+                    dot_pos = entry.name.rfind(".")
+                    ext = entry.name[dot_pos:].lower() if dot_pos >= 0 else "(no extension)"
+                    extensions[ext] = extensions.get(ext, 0) + 1
     except PermissionError:
         diag["reasons"].append("Permission denied reading directory")
         return diag
 
-    if not contents:
+    if not subdirs and file_count == 0:
         diag["reasons"].append("Directory is empty")
         return diag
 
-    # Categorize contents
-    subdirs = [c for c in contents if c.is_dir()]
-    files = [c for c in contents if c.is_file()]
-
-    diag["subdirectory_names"] = [d.name for d in subdirs]
-    diag["file_count"] = len(files)
-
-    # Check file extensions present
-    extensions = {}
-    for f in files:
-        ext = f.suffix.lower() if f.suffix else "(no extension)"
-        extensions[ext] = extensions.get(ext, 0) + 1
+    diag["subdirectory_names"] = subdirs
+    diag["file_count"] = file_count
     diag["file_extensions"] = extensions
 
     # Build human-readable reasons
-    if not subdirs and not files:
-        diag["reasons"].append("Directory is empty")
-    elif not subdirs and files:
+    if not subdirs and file_count > 0:
         if extensions:
             ext_summary = ", ".join(f"{count}x {ext}" for ext, count in sorted(extensions.items()))
-            diag["reasons"].append(f"No subdirectories; {len(files)} file(s) in root: {ext_summary}")
+            diag["reasons"].append(f"No subdirectories; {file_count} file(s) in root: {ext_summary}")
         else:
-            diag["reasons"].append(f"No subdirectories; {len(files)} file(s) with no recognized extensions")
+            diag["reasons"].append(f"No subdirectories; {file_count} file(s) with no recognized extensions")
 
-        # Specific hints
         if not any(ext in extensions for ext in (".fast5", ".pod5")):
             diag["reasons"].append("No .fast5 or .pod5 files found")
     else:
-        dir_names = ", ".join(d.name for d in subdirs[:10])
+        dir_names = ", ".join(subdirs[:10])
         diag["reasons"].append(f"Subdirectories found: {dir_names}")
 
         # Check which subdirs are readable
         unreadable = []
         readable_subdirs = []
-        for sd in subdirs:
-            try:
-                list(sd.iterdir())
-                readable_subdirs.append(sd)
-            except PermissionError:
-                unreadable.append(sd.name)
+        for sd_name in subdirs:
+            sd_path = run_path / sd_name
+            if _is_dir_readable(sd_path):
+                readable_subdirs.append(sd_path)
+            else:
+                unreadable.append(sd_name)
 
         if unreadable:
             diag["inaccessible_dirs"] = unreadable
@@ -458,24 +610,13 @@ def diagnose_unknown(run_path: Path) -> dict:
             )
 
         if not readable_subdirs and unreadable:
-            diag["reasons"].append("All subdirectories are unreadable — cannot determine format")
+            diag["reasons"].append("All subdirectories are unreadable -- cannot determine format")
             return diag
 
-        # Check if readable subdirs contain fast5/pod5 deeper than we searched
-        has_deep_fast5 = False
-        has_deep_pod5 = False
-        for sd in readable_subdirs[:10]:
-            try:
-                for f in sd.rglob("*.fast5"):
-                    has_deep_fast5 = True
-                    break
-                for f in sd.rglob("*.pod5"):
-                    has_deep_pod5 = True
-                    break
-            except PermissionError:
-                continue
-            if has_deep_fast5 or has_deep_pod5:
-                break
+        # Check if readable subdirs contain fast5/pod5 deeper than we searched.
+        # Uses bounded os.scandir walk instead of unbounded rglob.
+        has_deep_fast5 = any(_has_file_with_ext(sd, ".fast5") for sd in readable_subdirs[:10])
+        has_deep_pod5 = any(_has_file_with_ext(sd, ".pod5") for sd in readable_subdirs[:10])
 
         if has_deep_fast5:
             diag["reasons"].append("Found .fast5 files deeper in tree but not in expected locations (fast5/, root, or numeric subdirs)")
@@ -566,6 +707,11 @@ def main():
         action="store_true",
         help="Show detailed information per run",
     )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Skip file counting and size calculation; only report format classification",
+    )
     args = parser.parse_args()
 
     target = Path(args.target_folder)
@@ -597,35 +743,43 @@ def main():
         sys.exit(0)
 
     print(f"Found {len(run_dirs)} nanopore run(s) and {len(archive_files)} archive(s) in '{target}'\n")
-    print(f"{'Run / Archive':<55} {'Format(s)':<30} {'Files'}")
-    print("-" * 100)
+    print(f"{'Run / Archive':<55} {'Format(s)':<30} {'Size':<12} {'Files'}")
+    print("-" * 110)
 
     all_runs = {}
     format_summary = {"pod5": 0, "multi_read_fast5": 0, "single_read_fast5": 0,
                        "fastq": 0, "fast5_unknown": 0, "permission_denied": 0, "unknown": 0}
 
     for run_dir in run_dirs:
-        result = analyze_run(run_dir)
+        result = analyze_run(run_dir, quick=args.quick)
+
+        # Compute total run directory size (unless --quick)
+        if not args.quick:
+            total_size = compute_dir_size(run_dir)
+            result["total_size_bytes"] = total_size
+
         all_runs[run_dir.name] = result
 
         formats_str = ", ".join(result["formats"])
         file_counts = []
         for fmt in result["formats"]:
             detail = result["details"].get(fmt, {})
-            count = detail.get("file_count", 0)
+            count = detail.get("file_count")
             if count:
                 file_counts.append(f"{count}")
             format_summary[fmt] = format_summary.get(fmt, 0) + 1
 
         count_str = " / ".join(file_counts) if file_counts else "-"
+        size_str = format_size(result["total_size_bytes"]) if "total_size_bytes" in result else "-"
+
         # For unknown/permission_denied runs, show a brief reason even in non-verbose mode
         if "unknown" in result["formats"] or "permission_denied" in result["formats"]:
             fmt_key = "permission_denied" if "permission_denied" in result["formats"] else "unknown"
             reasons = result["details"].get(fmt_key, {}).get("reasons", [])
             short_reason = reasons[0] if reasons else "?"
-            print(f"{run_dir.name:<55} {fmt_key:<30} {short_reason}")
+            print(f"{run_dir.name:<55} {fmt_key:<30} {size_str:<12} {short_reason}")
         else:
-            print(f"{run_dir.name:<55} {formats_str:<30} {count_str}")
+            print(f"{run_dir.name:<55} {formats_str:<30} {size_str:<12} {count_str}")
 
         if args.verbose:
             for fmt in result["formats"]:
@@ -644,12 +798,14 @@ def main():
                 else:
                     if "directories" in detail:
                         for d in detail["directories"]:
-                            print(f"  └── {d}")
+                            print(f"  +-- {d}")
                     if "archive_files" in detail:
                         for a in detail["archive_files"]:
-                            print(f"  └── {a}")
+                            print(f"  +-- {a}")
+                    if "data_size_bytes" in detail:
+                        print(f"  data size: {format_size(detail['data_size_bytes'])}")
                     if "note" in detail:
-                        print(f"  ℹ  {detail['note']}")
+                        print(f"  note: {detail['note']}")
                     print_conversion_help(fmt)
             print()
 
@@ -674,9 +830,18 @@ def main():
                 }
             },
         }
+        # Compute archive file size (unless --quick)
+        if not args.quick:
+            try:
+                archive_size = archive.stat().st_size
+                result["total_size_bytes"] = archive_size
+            except OSError:
+                pass
+
         all_runs[name] = result
         format_summary["single_read_fast5"] = format_summary.get("single_read_fast5", 0) + 1
-        print(f"{archive.name:<55} {'single_read_fast5 (archive)':<30} -")
+        arc_size_str = format_size(result["total_size_bytes"]) if "total_size_bytes" in result else "-"
+        print(f"{archive.name:<55} {'single_read_fast5 (archive)':<30} {arc_size_str:<12} -")
 
         if args.verbose:
             print(f"  ℹ  Compressed archive — assumed single-read fast5")
@@ -684,7 +849,7 @@ def main():
             print()
 
     # Summary
-    print(f"\n{'='*100}")
+    print(f"\n{'='*110}")
     print("Summary:")
     for fmt, count in format_summary.items():
         if count > 0:

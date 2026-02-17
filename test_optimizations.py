@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""
+Tests for the optimized nanopore_format_checker.
+
+Creates mock directory trees to verify all format detection paths work
+correctly after the os.scandir optimization changes.
+"""
+
+import os
+import stat
+import sys
+import tempfile
+from pathlib import Path
+
+# Import the checker module from the same directory
+sys.path.insert(0, str(Path(__file__).parent))
+from nanopore_format_checker import (
+    analyze_run,
+    compute_dir_size,
+    diagnose_unknown,
+    discover_run_structure,
+    fast_count_files,
+    find_named_subdirs,
+    format_size,
+)
+
+
+def make_file(path: Path, size: int = 100) -> None:
+    """Create a file with the given size in bytes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\x00" * size)
+
+
+def test_pod5_subdirectory(tmp_path: Path) -> None:
+    """Run with pod5/ subdirectory containing .pod5 files."""
+    run = tmp_path / "20240101_run_pod5"
+    (run / "pod5").mkdir(parents=True)
+    make_file(run / "pod5" / "reads_001.pod5", size=5_000_000)
+    make_file(run / "pod5" / "reads_002.pod5", size=5_000_000)
+
+    result = analyze_run(run)
+    assert "pod5" in result["formats"], f"Expected pod5, got {result['formats']}"
+    assert result["details"]["pod5"]["file_count"] == 2
+    print("  PASS: pod5 subdirectory")
+
+
+def test_pod5_variant_dirs(tmp_path: Path) -> None:
+    """Run with pod5_pass/ and pod5_fail/ variant directories."""
+    run = tmp_path / "20240101_run_pod5var"
+    (run / "pod5_pass").mkdir(parents=True)
+    (run / "pod5_fail").mkdir(parents=True)
+    make_file(run / "pod5_pass" / "reads.pod5", size=5_000_000)
+
+    result = analyze_run(run)
+    assert "pod5" in result["formats"], f"Expected pod5, got {result['formats']}"
+    assert "pod5_fail" in result["details"]["pod5"]["folder_variants"]
+    assert "pod5_pass" in result["details"]["pod5"]["folder_variants"]
+    print("  PASS: pod5 variant directories")
+
+
+def test_multi_read_fast5(tmp_path: Path) -> None:
+    """Run with fast5/ containing multi-read fast5 files (>1MB each)."""
+    run = tmp_path / "20240101_run_multi"
+    (run / "fast5").mkdir(parents=True)
+    # Multi-read fast5 files are >1MB
+    make_file(run / "fast5" / "batch_001.fast5", size=2_000_000)
+    make_file(run / "fast5" / "batch_002.fast5", size=2_000_000)
+
+    result = analyze_run(run)
+    assert "multi_read_fast5" in result["formats"], f"Expected multi_read_fast5, got {result['formats']}"
+    assert result["details"]["multi_read_fast5"]["file_count"] == 2
+    print("  PASS: multi-read fast5 in fast5/ subdirectory")
+
+
+def test_single_read_fast5_in_fast5_dir(tmp_path: Path) -> None:
+    """Run with fast5/ containing single-read fast5 files (<1MB each)."""
+    run = tmp_path / "20240101_run_single_f5dir"
+    (run / "fast5").mkdir(parents=True)
+    # Single-read fast5 files are <1MB (typically 1-50KB)
+    for i in range(10):
+        make_file(run / "fast5" / f"read_{i:04d}.fast5", size=30_000)
+
+    result = analyze_run(run)
+    assert "single_read_fast5" in result["formats"], f"Expected single_read_fast5, got {result['formats']}"
+    print("  PASS: single-read fast5 in fast5/ subdirectory")
+
+
+def test_single_read_fast5_in_root(tmp_path: Path) -> None:
+    """Run with .fast5 files directly in root (no fast5/ subdirectory)."""
+    run = tmp_path / "20240101_run_single_root"
+    run.mkdir(parents=True)
+    for i in range(10):
+        make_file(run / f"read_{i:04d}.fast5", size=30_000)
+
+    result = analyze_run(run)
+    assert "single_read_fast5" in result["formats"], f"Expected single_read_fast5, got {result['formats']}"
+    assert result["details"]["single_read_fast5"]["layout"] == "root"
+    print("  PASS: single-read fast5 in root")
+
+
+def test_single_read_fast5_numeric_subdirs(tmp_path: Path) -> None:
+    """Run with numeric subdirs (0/, 1/, 2/) containing .fast5 files."""
+    run = tmp_path / "20240101_run_single_numeric"
+    run.mkdir(parents=True)
+    for subdir in range(3):
+        d = run / str(subdir)
+        d.mkdir()
+        for i in range(5):
+            make_file(d / f"read_{i:04d}.fast5", size=30_000)
+
+    result = analyze_run(run)
+    assert "single_read_fast5" in result["formats"], f"Expected single_read_fast5, got {result['formats']}"
+    assert result["details"]["single_read_fast5"]["layout"] == "numeric_subdirs"
+    print("  PASS: single-read fast5 in numeric subdirs")
+
+
+def test_fast5_variant_dirs(tmp_path: Path) -> None:
+    """Run with fast5_pass/ and fast5_fail/ variant directories."""
+    run = tmp_path / "20240101_run_f5var"
+    (run / "fast5_pass").mkdir(parents=True)
+    (run / "fast5_fail").mkdir(parents=True)
+    make_file(run / "fast5_pass" / "batch.fast5", size=2_000_000)
+
+    result = analyze_run(run)
+    assert "multi_read_fast5" in result["formats"], f"Expected multi_read_fast5, got {result['formats']}"
+    assert "fast5_fail" in result["details"]["multi_read_fast5"]["folder_variants"]
+    assert "fast5_pass" in result["details"]["multi_read_fast5"]["folder_variants"]
+    print("  PASS: fast5 variant directories")
+
+
+def test_compressed_archives(tmp_path: Path) -> None:
+    """Run with compressed archives in run directory."""
+    run = tmp_path / "20240101_run_archives"
+    run.mkdir(parents=True)
+    make_file(run / "reads.tar.gz", size=1000)
+    make_file(run / "more_reads.tgz", size=1000)
+
+    result = analyze_run(run)
+    assert "single_read_fast5" in result["formats"], f"Expected single_read_fast5, got {result['formats']}"
+    assert result["details"]["single_read_fast5"]["archive_count"] == 2
+    print("  PASS: compressed archives")
+
+
+def test_empty_directory(tmp_path: Path) -> None:
+    """Run with empty directory."""
+    run = tmp_path / "20240101_run_empty"
+    run.mkdir(parents=True)
+
+    result = analyze_run(run)
+    assert "unknown" in result["formats"], f"Expected unknown, got {result['formats']}"
+    print("  PASS: empty directory")
+
+
+def test_fastq_directory(tmp_path: Path) -> None:
+    """Run with fastq_pass/ directory."""
+    run = tmp_path / "20240101_run_fastq"
+    (run / "fastq_pass").mkdir(parents=True)
+    make_file(run / "fastq_pass" / "reads_001.fastq.gz", size=1000)
+    make_file(run / "fastq_pass" / "reads_002.fastq.gz", size=1000)
+    make_file(run / "fastq_pass" / "reads_003.fq", size=1000)
+
+    result = analyze_run(run)
+    assert "fastq" in result["formats"], f"Expected fastq, got {result['formats']}"
+    assert result["details"]["fastq"]["file_count"] == 3
+    print("  PASS: fastq directory")
+
+
+def test_mixed_formats(tmp_path: Path) -> None:
+    """Run with both pod5 and fast5 directories (both formats detected)."""
+    run = tmp_path / "20240101_run_mixed"
+    (run / "pod5").mkdir(parents=True)
+    (run / "fast5").mkdir(parents=True)
+    make_file(run / "pod5" / "reads.pod5", size=5_000_000)
+    make_file(run / "fast5" / "reads.fast5", size=2_000_000)
+
+    result = analyze_run(run)
+    assert "pod5" in result["formats"], f"Expected pod5 in {result['formats']}"
+    assert "multi_read_fast5" in result["formats"], f"Expected multi_read_fast5 in {result['formats']}"
+    print("  PASS: mixed formats (pod5 + multi_read_fast5)")
+
+
+def test_nested_pod5(tmp_path: Path) -> None:
+    """Run with pod5 directory nested several levels deep."""
+    run = tmp_path / "20240101_run_nested"
+    nested = run / "output" / "basecalling" / "pod5"
+    nested.mkdir(parents=True)
+    make_file(nested / "reads.pod5", size=5_000_000)
+
+    result = analyze_run(run)
+    assert "pod5" in result["formats"], f"Expected pod5, got {result['formats']}"
+    print("  PASS: nested pod5 directory")
+
+
+def test_find_named_subdirs_skips_files(tmp_path: Path) -> None:
+    """Verify find_named_subdirs only matches directories, not files."""
+    run = tmp_path / "20240101_run_findtest"
+    run.mkdir(parents=True)
+    # Create a file named "fast5" (not a directory)
+    make_file(run / "fast5", size=100)
+    # Create a directory named "fast5_pass"
+    (run / "fast5_pass").mkdir()
+
+    exact = find_named_subdirs(run, name="fast5")
+    prefix = find_named_subdirs(run, prefix="fast5_")
+    assert len(exact) == 0, f"Should not match file named fast5, got {exact}"
+    assert len(prefix) == 1, f"Should match fast5_pass directory, got {prefix}"
+    print("  PASS: find_named_subdirs skips files")
+
+
+def test_empty_fast5_dir(tmp_path: Path) -> None:
+    """Run with empty fast5/ directory -- should report fast5_unknown."""
+    run = tmp_path / "20240101_run_empty_f5"
+    (run / "fast5").mkdir(parents=True)
+
+    result = analyze_run(run)
+    assert "fast5_unknown" in result["formats"], f"Expected fast5_unknown, got {result['formats']}"
+    print("  PASS: empty fast5 directory")
+
+
+def test_fast5_with_numeric_subdirs(tmp_path: Path) -> None:
+    """Run with fast5/ containing numeric subdirs with single-read files."""
+    run = tmp_path / "20240101_run_f5_numeric"
+    fast5_dir = run / "fast5"
+    for subdir in range(3):
+        d = fast5_dir / str(subdir)
+        d.mkdir(parents=True)
+        for i in range(5):
+            make_file(d / f"read_{i:04d}.fast5", size=30_000)
+
+    result = analyze_run(run)
+    assert "single_read_fast5" in result["formats"], f"Expected single_read_fast5, got {result['formats']}"
+    assert "numeric subdirs" in result["details"]["single_read_fast5"].get("note", "")
+    print("  PASS: fast5/ with numeric subdirs")
+
+
+def test_many_files_in_root_performance(tmp_path: Path) -> None:
+    """Simulate a directory with many small files to verify the scan is not slow."""
+    import time
+    run = tmp_path / "20240101_run_perf"
+    run.mkdir(parents=True)
+    # Create 1000 small files (smaller than real 100k but enough to test the path)
+    for i in range(1000):
+        make_file(run / f"read_{i:06d}.fast5", size=100)
+
+    start = time.monotonic()
+    result = analyze_run(run)
+    elapsed = time.monotonic() - start
+
+    assert "single_read_fast5" in result["formats"], f"Expected single_read_fast5, got {result['formats']}"
+    # Should complete in well under 5 seconds even with 1000 files
+    assert elapsed < 5.0, f"Took too long: {elapsed:.2f}s"
+    print(f"  PASS: 1000 files in root ({elapsed:.3f}s)")
+
+
+def test_diagnose_unknown_with_deep_fast5(tmp_path: Path) -> None:
+    """Unknown run with .fast5 files buried deep in non-standard subdirs."""
+    run = tmp_path / "20240101_run_deep"
+    # Create a non-standard directory structure
+    deep = run / "custom_output" / "data" / "reads"
+    deep.mkdir(parents=True)
+    make_file(deep / "read_001.fast5", size=30_000)
+
+    result = analyze_run(run)
+    # This should be classified as unknown because the fast5 isn't in expected locations
+    assert "unknown" in result["formats"], f"Expected unknown, got {result['formats']}"
+    diag = result["details"]["unknown"]
+    assert any("deeper in tree" in r for r in diag["reasons"]), f"Should mention deep files: {diag['reasons']}"
+    print("  PASS: diagnose_unknown with deep fast5 files")
+
+
+def test_discover_run_structure(tmp_path: Path) -> None:
+    """Verify single-walk discovery finds all format categories."""
+    run = tmp_path / "20240101_run_discover"
+    (run / "pod5").mkdir(parents=True)
+    (run / "pod5_pass").mkdir(parents=True)
+    (run / "fast5").mkdir(parents=True)
+    (run / "fast5_fail").mkdir(parents=True)
+    (run / "fastq_pass").mkdir(parents=True)
+    # Nested pod5 inside a subdir
+    (run / "output" / "pod5").mkdir(parents=True)
+    # Non-matching directory
+    (run / "logs").mkdir(parents=True)
+
+    structure = discover_run_structure(run)
+    assert len(structure["pod5"]) == 2, f"Expected 2 pod5 dirs, got {structure['pod5']}"
+    assert len(structure["pod5_prefix"]) == 1, f"Expected 1 pod5_prefix, got {structure['pod5_prefix']}"
+    assert len(structure["fast5"]) == 1, f"Expected 1 fast5 dir, got {structure['fast5']}"
+    assert len(structure["fast5_prefix"]) == 1, f"Expected 1 fast5_prefix, got {structure['fast5_prefix']}"
+    assert len(structure["fastq_prefix"]) == 1, f"Expected 1 fastq_prefix, got {structure['fastq_prefix']}"
+    print("  PASS: discover_run_structure")
+
+
+def test_fast_count_files_returns_size(tmp_path: Path) -> None:
+    """Verify fast_count_files returns (count, size) tuple."""
+    d = tmp_path / "20240101_run_count_size" / "data"
+    d.mkdir(parents=True)
+    make_file(d / "a.pod5", size=1000)
+    make_file(d / "b.pod5", size=2000)
+    make_file(d / "c.txt", size=500)  # should not match
+
+    count, size = fast_count_files(d, ext=".pod5")
+    assert count == 2, f"Expected count=2, got {count}"
+    assert size == 3000, f"Expected size=3000, got {size}"
+    print("  PASS: fast_count_files returns (count, size)")
+
+
+def test_fast_count_files_recursive_size(tmp_path: Path) -> None:
+    """Verify recursive counting also accumulates size."""
+    base = tmp_path / "20240101_run_recsize" / "data"
+    (base / "sub1").mkdir(parents=True)
+    (base / "sub2").mkdir(parents=True)
+    make_file(base / "a.pod5", size=100)
+    make_file(base / "sub1" / "b.pod5", size=200)
+    make_file(base / "sub2" / "c.pod5", size=300)
+
+    count, size = fast_count_files(base, ext=".pod5", recursive=True)
+    assert count == 3, f"Expected count=3, got {count}"
+    assert size == 600, f"Expected size=600, got {size}"
+    print("  PASS: fast_count_files recursive with size")
+
+
+def test_format_size(tmp_path: Path) -> None:
+    """Verify human-readable size formatting."""
+    assert format_size(0) == "0 B"
+    assert format_size(512) == "512 B"
+    assert format_size(1024) == "1.0 KB"
+    assert format_size(1536) == "1.5 KB"
+    assert format_size(1_048_576) == "1.0 MB"
+    assert format_size(1_073_741_824) == "1.0 GB"
+    assert format_size(1_099_511_627_776) == "1.0 TB"
+    print("  PASS: format_size")
+
+
+def test_compute_dir_size(tmp_path: Path) -> None:
+    """Verify total directory size calculation."""
+    run = tmp_path / "20240101_run_dirsize"
+    (run / "sub").mkdir(parents=True)
+    make_file(run / "a.txt", size=100)
+    make_file(run / "sub" / "b.txt", size=200)
+
+    total = compute_dir_size(run)
+    assert total == 300, f"Expected 300, got {total}"
+    print("  PASS: compute_dir_size")
+
+
+def test_quick_mode(tmp_path: Path) -> None:
+    """Verify quick mode returns formats without counts or sizes."""
+    run = tmp_path / "20240101_run_quick"
+    (run / "pod5").mkdir(parents=True)
+    make_file(run / "pod5" / "reads.pod5", size=5_000_000)
+
+    result = analyze_run(run, quick=True)
+    assert "pod5" in result["formats"], f"Expected pod5, got {result['formats']}"
+    detail = result["details"]["pod5"]
+    assert "file_count" not in detail, f"Quick mode should not have file_count, got {detail}"
+    assert "data_size_bytes" not in detail, f"Quick mode should not have data_size_bytes, got {detail}"
+    print("  PASS: quick mode")
+
+
+def test_size_in_pod5_result(tmp_path: Path) -> None:
+    """Verify data_size_bytes appears in pod5 detail when not in quick mode."""
+    run = tmp_path / "20240101_run_pod5size"
+    (run / "pod5").mkdir(parents=True)
+    make_file(run / "pod5" / "reads_001.pod5", size=1000)
+    make_file(run / "pod5" / "reads_002.pod5", size=2000)
+
+    result = analyze_run(run)
+    assert "pod5" in result["formats"]
+    detail = result["details"]["pod5"]
+    assert detail["file_count"] == 2
+    assert detail["data_size_bytes"] == 3000, f"Expected 3000, got {detail.get('data_size_bytes')}"
+    print("  PASS: data_size_bytes in pod5 result")
+
+
+def test_size_in_fastq_result(tmp_path: Path) -> None:
+    """Verify data_size_bytes appears in fastq detail."""
+    run = tmp_path / "20240101_run_fqsize"
+    (run / "fastq_pass").mkdir(parents=True)
+    make_file(run / "fastq_pass" / "reads.fastq.gz", size=500)
+
+    result = analyze_run(run)
+    assert "fastq" in result["formats"]
+    detail = result["details"]["fastq"]
+    assert detail["file_count"] == 1
+    assert detail["data_size_bytes"] == 500, f"Expected 500, got {detail.get('data_size_bytes')}"
+    print("  PASS: data_size_bytes in fastq result")
+
+
+def main():
+    print("Running format detection tests...\n")
+    passed = 0
+    failed = 0
+
+    tests = [
+        test_pod5_subdirectory,
+        test_pod5_variant_dirs,
+        test_multi_read_fast5,
+        test_single_read_fast5_in_fast5_dir,
+        test_single_read_fast5_in_root,
+        test_single_read_fast5_numeric_subdirs,
+        test_fast5_variant_dirs,
+        test_compressed_archives,
+        test_empty_directory,
+        test_fastq_directory,
+        test_mixed_formats,
+        test_nested_pod5,
+        test_find_named_subdirs_skips_files,
+        test_empty_fast5_dir,
+        test_fast5_with_numeric_subdirs,
+        test_many_files_in_root_performance,
+        test_diagnose_unknown_with_deep_fast5,
+        test_discover_run_structure,
+        test_fast_count_files_returns_size,
+        test_fast_count_files_recursive_size,
+        test_format_size,
+        test_compute_dir_size,
+        test_quick_mode,
+        test_size_in_pod5_result,
+        test_size_in_fastq_result,
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        for test_fn in tests:
+            try:
+                test_fn(tmp_path)
+                passed += 1
+            except Exception as e:
+                print(f"  FAIL: {test_fn.__name__}: {e}")
+                failed += 1
+
+    print(f"\n{passed} passed, {failed} failed out of {passed + failed} tests")
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
