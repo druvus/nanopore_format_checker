@@ -57,11 +57,15 @@ def find_named_subdirs(
                 for entry in it:
                     if not entry.is_dir(follow_symlinks=False):
                         continue
+                    matched = False
                     if name is not None and entry.name == name:
                         matches.append(Path(entry.path))
+                        matched = True
                     elif prefix is not None and entry.name.startswith(prefix):
                         matches.append(Path(entry.path))
-                    _walk(entry.path, depth + 1)
+                        matched = True
+                    if not matched:
+                        _walk(entry.path, depth + 1)
         except PermissionError:
             pass
 
@@ -98,17 +102,25 @@ def discover_run_structure(run_path: Path, max_depth: int = 5) -> dict[str, list
                         continue
                     name = entry.name
                     path = Path(entry.path)
+                    matched = False
                     if name == "pod5":
                         result["pod5"].append(path)
+                        matched = True
                     elif name.startswith("pod5_"):
                         result["pod5_prefix"].append(path)
+                        matched = True
                     elif name == "fast5":
                         result["fast5"].append(path)
+                        matched = True
                     elif name.startswith("fast5_"):
                         result["fast5_prefix"].append(path)
+                        matched = True
                     elif name.startswith("fastq"):
                         result["fastq_prefix"].append(path)
-                    _walk(entry.path, depth + 1)
+                        matched = True
+
+                    if not matched:
+                        _walk(entry.path, depth + 1)
         except PermissionError:
             pass
 
@@ -530,14 +542,21 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
     return result
 
 
-def _has_file_with_ext(directory: Path, ext: str, max_depth: int = 5) -> bool:
-    """Check if any file with the given extension exists, with depth limit and early exit."""
+def _has_file_with_ext(directory: Path, ext: str, max_depth: int = 5,
+                       max_entries: int = 10_000) -> bool:
+    """Check if any file with the given extension exists, with depth and iteration limits."""
+    budget = max_entries
+
     def _search(path: str, depth: int) -> bool:
-        if depth > max_depth:
+        nonlocal budget
+        if depth > max_depth or budget <= 0:
             return False
         try:
             with os.scandir(path) as it:
                 for entry in it:
+                    budget -= 1
+                    if budget <= 0:
+                        return False
                     if entry.is_file(follow_symlinks=False) and entry.name.endswith(ext):
                         return True
                     if entry.is_dir(follow_symlinks=False) and _search(entry.path, depth + 1):
@@ -553,12 +572,19 @@ def diagnose_unknown(run_path: Path) -> dict:
     diag = {"reasons": []}
 
     # Separate files and directories in a single os.scandir pass
+    MAX_DIAG_ENTRIES = 5_000
     subdirs = []
     file_count = 0
     extensions = {}
+    truncated = False
     try:
+        entry_count = 0
         with os.scandir(run_path) as it:
             for entry in it:
+                entry_count += 1
+                if entry_count >= MAX_DIAG_ENTRIES:
+                    truncated = True
+                    break
                 if entry.is_dir(follow_symlinks=False):
                     subdirs.append(entry.name)
                 elif entry.is_file(follow_symlinks=False):
@@ -569,6 +595,9 @@ def diagnose_unknown(run_path: Path) -> dict:
     except PermissionError:
         diag["reasons"].append("Permission denied reading directory")
         return diag
+
+    if truncated:
+        diag["reasons"].append(f"Sampling stopped at {MAX_DIAG_ENTRIES} entries (directory may contain more)")
 
     if not subdirs and file_count == 0:
         diag["reasons"].append("Directory is empty")
@@ -743,7 +772,7 @@ def main():
         sys.exit(0)
 
     print(f"Found {len(run_dirs)} nanopore run(s) and {len(archive_files)} archive(s) in '{target}'\n")
-    print(f"{'Run / Archive':<55} {'Format(s)':<30} {'Size':<12} {'Files'}")
+    print(f"{'Run / Archive':<55} {'Format(s)':<30} {'Data size':<12} {'Files'}")
     print("-" * 110)
 
     all_runs = {}
@@ -753,10 +782,12 @@ def main():
     for run_dir in run_dirs:
         result = analyze_run(run_dir, quick=args.quick)
 
-        # Compute total run directory size (unless --quick)
+        # Sum recognized format data sizes (unless --quick)
         if not args.quick:
-            total_size = compute_dir_size(run_dir)
-            result["total_size_bytes"] = total_size
+            result["total_size_bytes"] = sum(
+                detail.get("data_size_bytes", 0)
+                for detail in result["details"].values()
+            )
 
         all_runs[run_dir.name] = result
 

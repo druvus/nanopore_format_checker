@@ -15,6 +15,7 @@ from pathlib import Path
 # Import the checker module from the same directory
 sys.path.insert(0, str(Path(__file__).parent))
 from nanopore_format_checker import (
+    _has_file_with_ext,
     analyze_run,
     compute_dir_size,
     diagnose_unknown,
@@ -386,6 +387,90 @@ def test_size_in_fastq_result(tmp_path: Path) -> None:
     print("  PASS: data_size_bytes in fastq result")
 
 
+def test_discover_skips_data_dirs(tmp_path: Path) -> None:
+    """Verify discover_run_structure does not recurse into matched data directories."""
+    run = tmp_path / "20240101_run_skipdata"
+    fast5_pass = run / "fast5_pass"
+    fast5_pass.mkdir(parents=True)
+    # Place a nested pod5/ inside fast5_pass -- should NOT be discovered
+    (fast5_pass / "pod5").mkdir()
+    # Also place a nested fast5/ inside pod5_pass -- should NOT be discovered
+    pod5_pass = run / "pod5_pass"
+    pod5_pass.mkdir(parents=True)
+    (pod5_pass / "fast5").mkdir()
+
+    structure = discover_run_structure(run)
+    assert len(structure["pod5"]) == 0, f"Should not find pod5 inside fast5_pass: {structure['pod5']}"
+    assert len(structure["fast5"]) == 0, f"Should not find fast5 inside pod5_pass: {structure['fast5']}"
+    assert len(structure["fast5_prefix"]) == 1, f"Should find fast5_pass: {structure['fast5_prefix']}"
+    assert len(structure["pod5_prefix"]) == 1, f"Should find pod5_pass: {structure['pod5_prefix']}"
+    print("  PASS: discover_run_structure skips data dirs")
+
+
+def test_find_named_subdirs_skips_matched(tmp_path: Path) -> None:
+    """Verify find_named_subdirs does not recurse into matched directories."""
+    run = tmp_path / "20240101_run_findskip"
+    fast5_dir = run / "fast5"
+    fast5_dir.mkdir(parents=True)
+    # Nest another fast5 inside -- should NOT be found if we skip matched dirs
+    (fast5_dir / "fast5").mkdir()
+
+    results = find_named_subdirs(run, name="fast5")
+    assert len(results) == 1, f"Should find only top-level fast5, got {results}"
+    print("  PASS: find_named_subdirs skips matched dirs")
+
+
+def test_has_file_with_ext_budget(tmp_path: Path) -> None:
+    """Verify _has_file_with_ext stops searching after budget is exhausted."""
+    d = tmp_path / "20240101_run_budget"
+    d.mkdir(parents=True)
+    # Create 20 non-matching files
+    for i in range(20):
+        make_file(d / f"file_{i:04d}.txt", size=10)
+    # Place a matching file that would only be found after budget runs out
+    make_file(d / "zzz_last.fast5", size=10)
+
+    # With budget of 5, should not find the .fast5 file (it comes after many .txt files)
+    found = _has_file_with_ext(d, ".fast5", max_entries=5)
+    assert not found, "Should not find .fast5 with budget=5"
+
+    # With default budget, should find it
+    found = _has_file_with_ext(d, ".fast5")
+    assert found, "Should find .fast5 with default budget"
+    print("  PASS: _has_file_with_ext budget")
+
+
+def test_diagnose_unknown_capped(tmp_path: Path) -> None:
+    """Verify diagnose_unknown caps its scan and reports truncation."""
+    run = tmp_path / "20240101_run_diagcap"
+    run.mkdir(parents=True)
+    # Create more files than the diagnostic cap
+    for i in range(5_100):
+        make_file(run / f"data_{i:06d}.bin", size=10)
+
+    diag = diagnose_unknown(run)
+    assert any("Sampling stopped" in r for r in diag["reasons"]), \
+        f"Should mention sampling cap: {diag['reasons']}"
+    print("  PASS: diagnose_unknown capped")
+
+
+def test_data_size_summing(tmp_path: Path) -> None:
+    """Verify that total_size_bytes is the sum of data_size_bytes from details."""
+    run = tmp_path / "20240101_run_datasum"
+    (run / "pod5").mkdir(parents=True)
+    (run / "fastq_pass").mkdir(parents=True)
+    make_file(run / "pod5" / "reads.pod5", size=1000)
+    make_file(run / "fastq_pass" / "reads.fastq.gz", size=500)
+
+    result = analyze_run(run)
+    expected = sum(
+        detail.get("data_size_bytes", 0)
+        for detail in result["details"].values()
+    )
+    assert expected == 1500, f"Expected 1500, got {expected}"
+    print("  PASS: data_size_bytes summing")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -417,6 +502,11 @@ def main():
         test_quick_mode,
         test_size_in_pod5_result,
         test_size_in_fastq_result,
+        test_discover_skips_data_dirs,
+        test_find_named_subdirs_skips_matched,
+        test_has_file_with_ext_budget,
+        test_diagnose_unknown_capped,
+        test_data_size_summing,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:
