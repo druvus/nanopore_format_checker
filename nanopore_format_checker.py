@@ -339,6 +339,33 @@ def extract_chemistry_fast5(file_path: Path) -> dict | None:
         return None
 
 
+def extract_chemistry_pod5(file_path: Path) -> dict | None:
+    """Extract flowcell chemistry metadata from a pod5 file.
+
+    Reads the RunInfo from the first read. Returns {"flowcell":
+    "FLO-MIN114", "kit": "SQK-LSK114", "sample_rate": 5000} or None.
+    """
+    if not HAS_POD5:
+        return None
+    try:
+        with pod5.Reader(file_path) as reader:
+            for read in reader.reads():
+                info = read.run_info
+                flowcell = info.flow_cell_product_code or ""
+                kit = info.sequencing_kit or ""
+                sample_rate = info.sample_rate or 0
+                if not flowcell:
+                    return None
+                return {
+                    "flowcell": flowcell.upper(),
+                    "kit": kit.upper(),
+                    "sample_rate": int(sample_rate),
+                }
+        return None
+    except Exception:
+        return None
+
+
 def count_files_recursive(directory: Path, ext: str) -> tuple[int, int]:
     """Count files with given extension recursively using fast os.scandir.
 

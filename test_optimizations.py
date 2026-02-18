@@ -24,6 +24,7 @@ from nanopore_format_checker import (
     discover_run_structure,
     estimate_dir_size,
     extract_chemistry_fast5,
+    extract_chemistry_pod5,
     fast_count_files,
     find_named_subdirs,
     format_size,
@@ -769,6 +770,17 @@ def test_extract_chemistry_fast5_multi_read(tmp_path: Path) -> None:
     print("  PASS: extract_chemistry_fast5 multi-read")
 
 
+def test_extract_chemistry_pod5_missing_lib(tmp_path: Path) -> None:
+    """extract_chemistry_pod5 returns None when pod5 is not installed or file is invalid."""
+    fake = tmp_path / "20240101_pod5_chem" / "fake.pod5"
+    fake.parent.mkdir(parents=True)
+    fake.write_bytes(b"\x00" * 100)
+    result = extract_chemistry_pod5(fake)
+    # Either None (pod5 not installed) or None (invalid file)
+    assert result is None
+    print("  PASS: extract_chemistry_pod5 missing lib or invalid file")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -819,6 +831,7 @@ def main():
         test_print_conversion_help_single_fast5,
         test_extract_chemistry_fast5_single_read,
         test_extract_chemistry_fast5_multi_read,
+        test_extract_chemistry_pod5_missing_lib,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:
