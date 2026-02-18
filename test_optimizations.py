@@ -584,7 +584,9 @@ def test_write_stats_tsv_basic(tmp_path: Path) -> None:
     assert len(lines) == 2, f"Expected 2 lines (header + 1 row), got {len(lines)}"
     header = lines[0].strip().split("\t")
     assert header == ["run_name", "format", "file_count", "data_size_bytes",
-                      "size_estimated", "directories", "notes"]
+                      "size_estimated", "directories", "notes",
+                      "flowcell_code", "sequencing_kit", "sample_rate",
+                      "pore_type", "dorado_version"]
     row = lines[1].strip().split("\t")
     assert row[0] == "20240101_run_pod5"
     assert row[1] == "pod5"
@@ -867,6 +869,44 @@ def test_analyze_run_includes_chemistry(tmp_path: Path) -> None:
     print("  PASS: analyze_run includes chemistry")
 
 
+def test_tsv_includes_chemistry_columns(tmp_path: Path) -> None:
+    """TSV output should include chemistry columns."""
+    all_runs = {
+        "20240101_run_chem": {
+            "formats": ["pod5"],
+            "details": {
+                "pod5": {
+                    "file_count": 5,
+                    "data_size_bytes": 1000,
+                    "directories": ["/data/run/pod5"],
+                }
+            },
+            "chemistry": {"flowcell": "FLO-MIN114", "kit": "SQK-LSK114", "sample_rate": 5000},
+            "chemistry_classification": {
+                "pore": "R10.4.1", "analyte": "dna",
+                "dorado_version": ">=1.0", "model_hint": "sup", "note": None,
+            },
+        }
+    }
+    tsv_path = str(tmp_path / "stats_chem.tsv")
+    write_stats_tsv(all_runs, tsv_path)
+
+    with open(tsv_path) as fh:
+        lines = fh.readlines()
+    header = lines[0].strip().split("\t")
+    assert "flowcell_code" in header
+    assert "sequencing_kit" in header
+    assert "sample_rate" in header
+    assert "pore_type" in header
+    assert "dorado_version" in header
+    row = lines[1].strip().split("\t")
+    fc_idx = header.index("flowcell_code")
+    assert row[fc_idx] == "FLO-MIN114"
+    pore_idx = header.index("pore_type")
+    assert row[pore_idx] == "R10.4.1"
+    print("  PASS: TSV includes chemistry columns")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -925,6 +965,7 @@ def main():
         test_classify_chemistry_rna002,
         test_classify_chemistry_unknown,
         test_analyze_run_includes_chemistry,
+        test_tsv_includes_chemistry_columns,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:

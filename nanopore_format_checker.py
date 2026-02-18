@@ -999,7 +999,9 @@ def write_stats_tsv(all_runs: dict, output_path: str) -> None:
     directories, notes
     """
     header = ["run_name", "format", "file_count", "data_size_bytes",
-              "size_estimated", "directories", "notes"]
+              "size_estimated", "directories", "notes",
+              "flowcell_code", "sequencing_kit", "sample_rate",
+              "pore_type", "dorado_version"]
     with open(output_path, "w") as fh:
         fh.write("\t".join(header) + "\n")
         for run_name, info in all_runs.items():
@@ -1022,6 +1024,8 @@ def write_stats_tsv(all_runs: dict, output_path: str) -> None:
                 for af in detail.get("archive_files", []):
                     notes_parts.append(f"archive: {af}")
                 notes = "; ".join(notes_parts)
+                chem = info.get("chemistry") or {}
+                chem_class = info.get("chemistry_classification") or {}
                 row = [
                     run_name,
                     fmt,
@@ -1030,6 +1034,11 @@ def write_stats_tsv(all_runs: dict, output_path: str) -> None:
                     str(estimated),
                     dirs,
                     notes,
+                    chem.get("flowcell", ""),
+                    chem.get("kit", ""),
+                    str(chem.get("sample_rate", "")) if chem.get("sample_rate") else "",
+                    chem_class.get("pore", ""),
+                    chem_class.get("dorado_version", "") or "",
                 ]
                 fh.write("\t".join(row) + "\n")
 
@@ -1105,8 +1114,8 @@ def main():
         sys.exit(0)
 
     print(f"Found {len(run_dirs)} nanopore run(s) and {len(archive_files)} archive(s) in '{target}'\n")
-    print(f"{'Run / Archive':<55} {'Format(s)':<30} {'Data size':<12} {'Files'}")
-    print("-" * 110)
+    print(f"{'Run / Archive':<55} {'Format(s)':<25} {'Chemistry':<18} {'Data size':<12} {'Files'}")
+    print("-" * 120)
 
     all_runs = {}
     format_summary = {"pod5": 0, "multi_read_fast5": 0, "single_read_fast5": 0,
@@ -1138,14 +1147,23 @@ def main():
         if any(d.get("size_estimated") for d in result["details"].values()):
             size_str = "~" + size_str
 
+        chem_class = result.get("chemistry_classification")
+        if chem_class and chem_class["pore"] != "unknown":
+            chem_str = chem_class["pore"]
+            rate = result.get("chemistry", {}).get("sample_rate", 0)
+            if rate:
+                chem_str += f" {rate // 1000}kHz"
+        else:
+            chem_str = "-"
+
         # For unknown/permission_denied runs, show a brief reason even in non-verbose mode
         if "unknown" in result["formats"] or "permission_denied" in result["formats"]:
             fmt_key = "permission_denied" if "permission_denied" in result["formats"] else "unknown"
             reasons = result["details"].get(fmt_key, {}).get("reasons", [])
             short_reason = reasons[0] if reasons else "?"
-            print(f"{run_dir.name:<55} {fmt_key:<30} {size_str:<12} {short_reason}")
+            print(f"{run_dir.name:<55} {fmt_key:<25} {'-':<18} {size_str:<12} {short_reason}")
         else:
-            print(f"{run_dir.name:<55} {formats_str:<30} {size_str:<12} {count_str}")
+            print(f"{run_dir.name:<55} {formats_str:<25} {chem_str:<18} {size_str:<12} {count_str}")
 
         if args.verbose:
             for fmt in result["formats"]:
@@ -1174,6 +1192,19 @@ def main():
                     if "note" in detail:
                         print(f"  note: {detail['note']}")
                     print_conversion_help(fmt)
+            # Show chemistry info in verbose mode
+            chem = result.get("chemistry")
+            chem_class = result.get("chemistry_classification")
+            if chem and chem_class:
+                rate = chem.get("sample_rate", 0)
+                rate_str = f", {rate} Hz" if rate else ""
+                print(f"  chemistry: {chem_class['pore']} ({chem['flowcell']}, {chem['kit']}{rate_str})")
+                if chem_class.get("dorado_version"):
+                    ver = chem_class["dorado_version"]
+                    print(f"  dorado: use version {ver}")
+                    if chem_class.get("note"):
+                        print(f"          {chem_class['note']}")
+                    print(f"  model: dorado basecaller {chem_class['model_hint']} <input>/")
             print()
 
     # Process compressed archives in target folder as single_read_fast5
@@ -1208,7 +1239,7 @@ def main():
         all_runs[name] = result
         format_summary["single_read_fast5"] = format_summary.get("single_read_fast5", 0) + 1
         arc_size_str = format_size(result["total_size_bytes"]) if "total_size_bytes" in result else "-"
-        print(f"{archive.name:<55} {'single_read_fast5 (archive)':<30} {arc_size_str:<12} -")
+        print(f"{archive.name:<55} {'single_read_fast5 (archive)':<25} {'-':<18} {arc_size_str:<12} -")
 
         if args.verbose:
             print(f"  ℹ  Compressed archive — assumed single-read fast5")
@@ -1216,7 +1247,7 @@ def main():
             print()
 
     # Summary
-    print(f"\n{'='*110}")
+    print(f"\n{'='*120}")
     print("Summary:")
     for fmt, count in format_summary.items():
         if count > 0:
