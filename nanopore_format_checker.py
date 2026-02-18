@@ -40,6 +40,13 @@ FLOWCELL_PORE = {
     "FLO-PRO114": "R10.4.1",
     "FLO-FLG114": "R10.4.1",
     "FLO-PRO114M": "R10.4.1",
+    # R10.4.1 HD (high-duplex flowcells)
+    "FLO-MIN114HD": "R10.4.1",
+    "FLO-PRO114HD": "R10.4.1",
+    "FLO-FLG114HD": "R10.4.1",
+    # R10.4 (intermediate, pre-R10.4.1)
+    "FLO-MIN112": "R10.4",
+    "FLO-PRO112": "R10.4",
     # R9.4.1
     "FLO-MIN106": "R9.4.1",
     "FLO-MIN106D": "R9.4.1",
@@ -47,6 +54,13 @@ FLOWCELL_PORE = {
     "FLO-FLG001": "R9.4.1",
     "FLO-PRO002": "R9.4.1",
     "FLO-PRO002M": "R9.4.1",
+    # R9.4.1 special
+    "FLO-MINSP6": "R9.4.1",
+    "FLO-PRO001": "R9.4.1",
+    "FLO-PRO002-ECO": "R9.4.1",
+    # RNA (direct RNA flowcells)
+    "FLO-MIN004RA": "RNA004",
+    "FLO-PRO004RA": "RNA004",
 }
 
 
@@ -307,9 +321,10 @@ def _decode_attr(val):
 def extract_chemistry_fast5(file_path: Path) -> dict | None:
     """Extract flowcell chemistry metadata from a fast5 file.
 
-    Reads context_tags attributes from the HDF5 file. Handles both
-    single-read (UniqueGlobalKey/context_tags) and multi-read
-    (<read_id>/context_tags) layouts.
+    Reads context_tags and tracking_id attributes from the HDF5 file.
+    Handles both single-read (UniqueGlobalKey/) and multi-read
+    (<read_id>/) layouts. Falls back to tracking_id/flow_cell_product_code
+    when context_tags/flowcell_type is empty or missing.
 
     Returns {"flowcell": "FLO-MIN114", "kit": "SQK-LSK114",
     "sample_rate": 5000} or None on failure.
@@ -319,19 +334,40 @@ def extract_chemistry_fast5(file_path: Path) -> dict | None:
     try:
         with h5py.File(file_path, "r") as f:
             ctx = None
-            if "UniqueGlobalKey" in f and "context_tags" in f["UniqueGlobalKey"]:
-                ctx = f["UniqueGlobalKey/context_tags"]
+            trk = None
+            if "UniqueGlobalKey" in f:
+                if "context_tags" in f["UniqueGlobalKey"]:
+                    ctx = f["UniqueGlobalKey/context_tags"]
+                if "tracking_id" in f["UniqueGlobalKey"]:
+                    trk = f["UniqueGlobalKey/tracking_id"]
             else:
                 for key in f.keys():
-                    if "context_tags" in f[key]:
+                    if ctx is None and "context_tags" in f[key]:
                         ctx = f[f"{key}/context_tags"]
+                    if trk is None and "tracking_id" in f[key]:
+                        trk = f[f"{key}/tracking_id"]
+                    if ctx is not None and trk is not None:
                         break
-            if ctx is None:
-                return None
-            flowcell = _decode_attr(ctx.attrs.get("flowcell_type", "")).upper()
-            kit = _decode_attr(ctx.attrs.get("sequencing_kit", "")).upper()
-            rate_str = _decode_attr(ctx.attrs.get("sample_frequency", "0"))
-            sample_rate = int(rate_str) if rate_str.isdigit() else 0
+
+            # Get flowcell from context_tags first, fall back to tracking_id
+            flowcell = ""
+            kit = ""
+            sample_rate = 0
+
+            if ctx is not None:
+                flowcell = _decode_attr(ctx.attrs.get("flowcell_type", "")).upper()
+                kit = _decode_attr(ctx.attrs.get("sequencing_kit", "")).upper()
+                rate_str = _decode_attr(ctx.attrs.get("sample_frequency", "0"))
+                sample_rate = int(rate_str) if rate_str.isdigit() else 0
+
+            # Fallback to tracking_id for flowcell product code
+            if not flowcell and trk is not None:
+                flowcell = _decode_attr(trk.attrs.get("flow_cell_product_code", "")).upper()
+            # Also try tracking_id for sample_frequency if not found
+            if sample_rate == 0 and trk is not None:
+                rate_str = _decode_attr(trk.attrs.get("sample_frequency", "0"))
+                sample_rate = int(rate_str) if rate_str.isdigit() else 0
+
             if not flowcell:
                 return None
             return {"flowcell": flowcell, "kit": kit, "sample_rate": sample_rate}
@@ -415,6 +451,15 @@ def classify_chemistry(chemistry: dict) -> dict:
         else:
             dorado_version = "0.9.6"
             note = "R10.4.1 at 4kHz requires dorado 0.9.6; 5kHz data supported in >=1.0"
+    elif pore == "R10.4":
+        if sample_rate >= 5000:
+            dorado_version = ">=1.0"
+        else:
+            dorado_version = "0.9.6"
+            note = "R10.4 at 4kHz requires dorado 0.9.6"
+    elif pore == "RNA004":
+        analyte = "rna"
+        dorado_version = ">=1.0"
     # pore == "unknown" -> dorado_version stays None
 
     return {

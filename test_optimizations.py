@@ -869,6 +869,75 @@ def test_analyze_run_includes_chemistry(tmp_path: Path) -> None:
     print("  PASS: analyze_run includes chemistry")
 
 
+def test_extract_chemistry_fast5_tracking_id_fallback(tmp_path: Path) -> None:
+    """Extract chemistry when context_tags/flowcell_type is empty but tracking_id has it."""
+    f5 = tmp_path / "20240101_chem_trk" / "read.fast5"
+    f5.parent.mkdir(parents=True)
+    import h5py
+    with h5py.File(f5, "w") as f:
+        ctx = f.create_group("UniqueGlobalKey/context_tags")
+        ctx.attrs["flowcell_type"] = ""  # empty
+        ctx.attrs["sequencing_kit"] = "sqk-lsk114"
+        ctx.attrs["sample_frequency"] = "5000"
+        trk = f.create_group("UniqueGlobalKey/tracking_id")
+        trk.attrs["flow_cell_product_code"] = "flo-min114"
+        trk.attrs["sample_frequency"] = "5000"
+    result = extract_chemistry_fast5(f5)
+    assert result is not None, "Should fall back to tracking_id"
+    assert result["flowcell"] == "FLO-MIN114"
+    assert result["kit"] == "SQK-LSK114"
+    assert result["sample_rate"] == 5000
+    print("  PASS: extract_chemistry_fast5 tracking_id fallback")
+
+
+def test_extract_chemistry_fast5_multi_read_tracking_id(tmp_path: Path) -> None:
+    """Extract chemistry from multi-read layout using tracking_id fallback."""
+    f5 = tmp_path / "20240101_chem_mr_trk" / "read.fast5"
+    f5.parent.mkdir(parents=True)
+    import h5py
+    with h5py.File(f5, "w") as f:
+        ctx = f.create_group("read_abc123/context_tags")
+        ctx.attrs["flowcell_type"] = ""  # empty
+        ctx.attrs["sequencing_kit"] = "sqk-lsk109"
+        ctx.attrs["sample_frequency"] = "0"
+        trk = f.create_group("read_abc123/tracking_id")
+        trk.attrs["flow_cell_product_code"] = "flo-min106"
+        trk.attrs["sample_frequency"] = "4000"
+    result = extract_chemistry_fast5(f5)
+    assert result is not None, "Should fall back to tracking_id in multi-read layout"
+    assert result["flowcell"] == "FLO-MIN106"
+    assert result["sample_rate"] == 4000
+    print("  PASS: extract_chemistry_fast5 multi-read tracking_id fallback")
+
+
+def test_classify_chemistry_r10_4(tmp_path: Path) -> None:
+    """R10.4 at 5kHz should recommend dorado >=1.0."""
+    chem = {"flowcell": "FLO-MIN112", "kit": "SQK-LSK114", "sample_rate": 5000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "R10.4"
+    assert result["dorado_version"] == ">=1.0"
+    print("  PASS: classify_chemistry R10.4 5kHz")
+
+
+def test_classify_chemistry_rna_flowcell(tmp_path: Path) -> None:
+    """RNA004 flowcell (FLO-MIN004RA) should map to RNA004 pore."""
+    chem = {"flowcell": "FLO-MIN004RA", "kit": "SQK-RNA004", "sample_rate": 4000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "RNA004"
+    assert result["analyte"] == "rna"
+    assert result["dorado_version"] == ">=1.0"
+    print("  PASS: classify_chemistry RNA004 flowcell")
+
+
+def test_classify_chemistry_hd_flowcell(tmp_path: Path) -> None:
+    """FLO-MIN114HD should map to R10.4.1."""
+    chem = {"flowcell": "FLO-MIN114HD", "kit": "SQK-LSK114", "sample_rate": 5000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "R10.4.1"
+    assert result["dorado_version"] == ">=1.0"
+    print("  PASS: classify_chemistry HD flowcell")
+
+
 def test_tsv_includes_chemistry_columns(tmp_path: Path) -> None:
     """TSV output should include chemistry columns."""
     all_runs = {
@@ -957,6 +1026,8 @@ def main():
         test_print_conversion_help_single_fast5,
         test_extract_chemistry_fast5_single_read,
         test_extract_chemistry_fast5_multi_read,
+        test_extract_chemistry_fast5_tracking_id_fallback,
+        test_extract_chemistry_fast5_multi_read_tracking_id,
         test_extract_chemistry_pod5_missing_lib,
         test_classify_chemistry_r10_5khz,
         test_classify_chemistry_r9,
@@ -964,6 +1035,9 @@ def main():
         test_classify_chemistry_rna004,
         test_classify_chemistry_rna002,
         test_classify_chemistry_unknown,
+        test_classify_chemistry_r10_4,
+        test_classify_chemistry_rna_flowcell,
+        test_classify_chemistry_hd_flowcell,
         test_analyze_run_includes_chemistry,
         test_tsv_includes_chemistry_columns,
     ]
