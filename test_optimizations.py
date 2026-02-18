@@ -839,6 +839,34 @@ def test_classify_chemistry_unknown(tmp_path: Path) -> None:
     print("  PASS: classify_chemistry unknown flowcell")
 
 
+def test_analyze_run_includes_chemistry(tmp_path: Path) -> None:
+    """analyze_run() should include chemistry from fast5 metadata."""
+    import h5py
+    run = tmp_path / "20240101_run_chem"
+    fast5_dir = run / "fast5"
+    fast5_dir.mkdir(parents=True)
+    f5 = fast5_dir / "batch_001.fast5"
+    # Create a multi-read fast5 (>1MB) with chemistry metadata
+    with h5py.File(f5, "w") as f:
+        ctx = f.create_group("read_001/context_tags")
+        ctx.attrs["flowcell_type"] = "flo-min106"
+        ctx.attrs["sequencing_kit"] = "sqk-lsk109"
+        ctx.attrs["sample_frequency"] = "4000"
+        # Pad to >1MB for multi-read classification
+        import numpy as np
+        f.create_dataset("read_001/Raw/Signal", data=np.zeros(375_000, dtype=np.int32))
+
+    result = analyze_run(run)
+    assert "chemistry" in result, f"Missing chemistry key: {result.keys()}"
+    assert result["chemistry"]["flowcell"] == "FLO-MIN106"
+    assert result["chemistry"]["kit"] == "SQK-LSK109"
+    clas = result.get("chemistry_classification")
+    assert clas is not None
+    assert clas["pore"] == "R9.4.1"
+    assert clas["dorado_version"] == "0.9.6"
+    print("  PASS: analyze_run includes chemistry")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -896,6 +924,7 @@ def main():
         test_classify_chemistry_rna004,
         test_classify_chemistry_rna002,
         test_classify_chemistry_unknown,
+        test_analyze_run_includes_chemistry,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:

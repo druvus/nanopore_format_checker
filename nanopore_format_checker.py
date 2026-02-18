@@ -485,7 +485,7 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
         - formats: list of detected formats
         - details: dict with per-format info (paths, file counts)
     """
-    result = {"formats": [], "details": {}}
+    result = {"formats": [], "details": {}, "chemistry": None, "chemistry_classification": None}
 
     # --- Check permissions on run directory and its subdirectories ---
     # Use os.scandir to extract only subdirectories, skipping all files.
@@ -549,6 +549,25 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
             pod5_detail["note"] = "Empty pod5 folder(s) found"
         result["formats"].append("pod5")
         result["details"]["pod5"] = pod5_detail
+
+        # Extract chemistry from first pod5 file
+        if result["chemistry"] is None:
+            for d in all_pod5_dirs:
+                if str(d) in unreadable_pod5:
+                    continue
+                try:
+                    with os.scandir(d) as it:
+                        for entry in it:
+                            if entry.is_file(follow_symlinks=False) and entry.name.endswith(".pod5"):
+                                chem = extract_chemistry(Path(entry.path), "pod5")
+                                if chem:
+                                    result["chemistry"] = chem
+                                    result["chemistry_classification"] = classify_chemistry(chem)
+                            break
+                except PermissionError:
+                    pass
+                if result["chemistry"]:
+                    break
 
     # --- Check for fast5 (fast5/ or fast5_skip/fast5_pass/fast5_fail, up to 5 levels down) ---
     all_fast5_dirs = fast5_dirs + fast5_variant_dirs
@@ -628,6 +647,12 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
                 result["details"]["fast5_unknown"] = fast5_info
                 if not HAS_H5PY:
                     fast5_info["note"] = "Install h5py to distinguish single/multi read fast5"
+
+            if sample_file and result["chemistry"] is None:
+                chem = extract_chemistry(sample_file, "fast5")
+                if chem:
+                    result["chemistry"] = chem
+                    result["chemistry_classification"] = classify_chemistry(chem)
         elif unreadable_fast5:
             # Found fast5 dirs but can't read into them — can't determine format without access
             fast5_info["note"] = f"Permission denied on {len(unreadable_fast5)} fast5 dir(s) — format unknown"
@@ -676,10 +701,10 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
                 for entry in it:
                     # Check for .fast5 file in root (just need one for classification)
                     if not sample_file and entry.is_file(follow_symlinks=False) and entry.name.endswith(".fast5"):
-                        # Quick size check without creating Path object
+                        # Quick size check
                         size_bytes = entry.stat(follow_symlinks=False).st_size
                         classification = "single_read_fast5" if size_bytes < 1_000_000 else "multi_read_fast5"
-                        sample_file = entry.name
+                        sample_file = Path(entry.path)
                         fast5_in_root = True
                     # Check for numeric subdirectory
                     elif not has_numeric_dirs and entry.is_dir(follow_symlinks=False) and re.match(r"^\d+$", entry.name):
@@ -692,7 +717,7 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
                                         if sub_entry.is_file(follow_symlinks=False) and sub_entry.name.endswith(".fast5"):
                                             size_bytes = sub_entry.stat(follow_symlinks=False).st_size
                                             classification = "single_read_fast5" if size_bytes < 1_000_000 else "multi_read_fast5"
-                                            sample_file = sub_entry.name
+                                            sample_file = Path(sub_entry.path)
                                             break
                             except PermissionError:
                                 pass
@@ -704,7 +729,7 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
 
         if sample_file and classification:
             fast5_info = {
-                "sampled_file": sample_file,
+                "sampled_file": sample_file.name if isinstance(sample_file, Path) else sample_file,
                 "layout": "root" if fast5_in_root else "numeric_subdirs",
                 "size_based_classification": True,
             }
@@ -716,6 +741,13 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
                 fast5_info["data_size_bytes"] = size
                 if is_estimated:
                     fast5_info["size_estimated"] = True
+
+            if sample_file and classification and result["chemistry"] is None:
+                sample_path = sample_file if isinstance(sample_file, Path) else run_path / sample_file
+                chem = extract_chemistry(sample_path, "fast5")
+                if chem:
+                    result["chemistry"] = chem
+                    result["chemistry_classification"] = classify_chemistry(chem)
 
             if classification in ("single_read_fast5", "multi_read_fast5"):
                 result["formats"].append(classification)
