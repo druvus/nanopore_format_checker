@@ -645,7 +645,7 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
         - formats: list of detected formats
         - details: dict with per-format info (paths, file counts)
     """
-    result = {"formats": [], "details": {}, "chemistry": None, "chemistry_classification": None}
+    result = {"formats": [], "details": {}, "chemistry": None, "chemistry_classification": None, "run_path": str(run_path)}
 
     # --- Check permissions on run directory and its subdirectories ---
     # Use os.scandir to extract only subdirectories, skipping all files.
@@ -1065,15 +1065,15 @@ def print_conversion_help(fmt: str):
     """Print conversion instructions for a given format."""
     if fmt == "multi_read_fast5":
         print("  Conversion options:")
-        print("    -> To pod5:         pod5 convert fast5 ./fast5_dir/ --output ./pod5_dir/ --threads 1 --recursive")
+        print("    -> To pod5:         pod5 convert fast5 ./run_dir/ --output ./pod5_dir/ --threads 20 --recursive")
         print("                        # https://github.com/nanoporetech/pod5-file-format")
         print("    -> To single_fast5: multi_to_single_fast5 --input_path multi/ --save_path single/")
         print("                        # https://github.com/nanoporetech/ont_fast5_api")
     elif fmt == "single_read_fast5":
         print("  Conversion options:")
         print("    -> To pod5 (two steps required):")
-        print("       1. single_to_multi_fast5 -i single_dir/ -s multi_dir/ -t 4 --recursive")
-        print("       2. pod5 convert fast5 multi_dir/ --output pod5_dir/ --threads 1 --recursive")
+        print("       1. single_to_multi_fast5 -i run_dir/ -s multi_dir/ -t 4 --recursive")
+        print("       2. pod5 convert fast5 multi_dir/ --output pod5_dir/ --threads 20 --recursive")
         print("       # single-read fast5 must first be merged to multi-read format")
         print("    -> To multi_fast5:  single_to_multi_fast5 -i single_dir/ -s multi_dir/ -t 4 --recursive")
     elif fmt == "pod5":
@@ -1103,33 +1103,31 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str |
                 continue  # Already in target format
 
             if target_format == "pod5" and fmt == "multi_read_fast5":
-                dirs = info["details"].get(fmt, {}).get("directories", [])
-                for d in dirs:
-                    if output_dir:
-                        out = os.path.join(output_dir, run_name, "pod5")
-                    else:
-                        out = os.path.join(os.path.dirname(d), "pod5")
-                    lines.append(f"echo 'Converting {run_name} ({fmt} -> pod5)...'")
-                    lines.append(f"mkdir -p '{out}'")
-                    lines.append(f"pod5 convert fast5 '{d}/' --output '{out}/' --threads 1 --recursive")
-                    lines.append("")
+                run_path = info.get("run_path", "")
+                if output_dir:
+                    out = os.path.join(output_dir, run_name, "pod5")
+                else:
+                    out = os.path.join(run_path, "pod5")
+                lines.append(f"echo 'Converting {run_name} ({fmt} -> pod5)...'")
+                lines.append(f"mkdir -p '{out}'")
+                lines.append(f"pod5 convert fast5 '{run_path}/' --output '{out}/' --threads 20 --recursive")
+                lines.append("")
 
             elif target_format == "pod5" and fmt == "single_read_fast5":
-                dirs = info["details"].get(fmt, {}).get("directories", [])
-                for d in dirs:
-                    if output_dir:
-                        base = os.path.join(output_dir, run_name)
-                    else:
-                        base = os.path.dirname(d)
-                    multi_tmp = os.path.join(base, "multi_fast5_tmp")
-                    out = os.path.join(base, "pod5")
-                    lines.append(f"echo 'Converting {run_name} ({fmt} -> pod5, two steps)...'")
-                    lines.append(f"mkdir -p '{multi_tmp}'")
-                    lines.append(f"single_to_multi_fast5 -i '{d}' -s '{multi_tmp}' -t 4 --recursive")
-                    lines.append(f"mkdir -p '{out}'")
-                    lines.append(f"pod5 convert fast5 '{multi_tmp}/' --output '{out}/' --threads 1 --recursive")
-                    lines.append(f"# intermediate multi-read fast5 kept in '{multi_tmp}' -- remove manually if no longer needed")
-                    lines.append("")
+                run_path = info.get("run_path", "")
+                if output_dir:
+                    base = os.path.join(output_dir, run_name)
+                else:
+                    base = run_path
+                multi_tmp = os.path.join(base, "multi_fast5_tmp")
+                out = os.path.join(base, "pod5")
+                lines.append(f"echo 'Converting {run_name} ({fmt} -> pod5, two steps)...'")
+                lines.append(f"mkdir -p '{multi_tmp}'")
+                lines.append(f"single_to_multi_fast5 -i '{run_path}' -s '{multi_tmp}' -t 4 --recursive")
+                lines.append(f"mkdir -p '{out}'")
+                lines.append(f"pod5 convert fast5 '{multi_tmp}/' --output '{out}/' --threads 20 --recursive")
+                lines.append(f"# intermediate multi-read fast5 kept in '{multi_tmp}' -- remove manually if no longer needed")
+                lines.append("")
 
             elif target_format == "single_fast5" and fmt == "multi_read_fast5":
                 dirs = info["details"].get(fmt, {}).get("directories", [])
