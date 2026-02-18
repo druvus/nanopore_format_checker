@@ -28,6 +28,27 @@ try:
 except ImportError:
     HAS_H5PY = False
 
+try:
+    import pod5
+    HAS_POD5 = True
+except ImportError:
+    HAS_POD5 = False
+
+FLOWCELL_PORE = {
+    # R10.4.1
+    "FLO-MIN114": "R10.4.1",
+    "FLO-PRO114": "R10.4.1",
+    "FLO-FLG114": "R10.4.1",
+    "FLO-PRO114M": "R10.4.1",
+    # R9.4.1
+    "FLO-MIN106": "R9.4.1",
+    "FLO-MIN106D": "R9.4.1",
+    "FLO-MIN107": "R9.4.1",
+    "FLO-FLG001": "R9.4.1",
+    "FLO-PRO002": "R9.4.1",
+    "FLO-PRO002M": "R9.4.1",
+}
+
 
 def is_nanopore_run_dir(dirname: str) -> bool:
     """Check if directory name matches nanopore run naming convention (starts with date)."""
