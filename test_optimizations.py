@@ -994,6 +994,27 @@ def test_extract_chemistry_pod5_sample_rate_only(tmp_path: Path) -> None:
     print("  PASS: extract_chemistry_pod5 sample-rate-only (converted from old fast5)")
 
 
+def test_classify_chemistry_sample_rate_6khz_promethion(tmp_path: Path) -> None:
+    """6kHz PromethION from 2018 should be R9.4.1, not R10.4.1."""
+    chem = {"flowcell": "", "kit": "", "sample_rate": 6000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "R9.4.1", (
+        f"6kHz PromethION should be R9.4.1, got {result['pore']}"
+    )
+    assert result["dorado_version"] == "0.9.6"
+    print("  PASS: classify_chemistry 6kHz PromethION -> R9.4.1")
+
+
+def test_classify_chemistry_sample_rate_3khz(tmp_path: Path) -> None:
+    """3kHz from very old runs should map to R9.4.1."""
+    chem = {"flowcell": "", "kit": "", "sample_rate": 3012}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "R9.4.1", (
+        f"3kHz should be R9.4.1, got {result['pore']}"
+    )
+    print("  PASS: classify_chemistry 3kHz -> R9.4.1")
+
+
 def test_extract_chemistry_pod5_context_tags_fallback(tmp_path: Path) -> None:
     """Pod5 with flowcell in context_tags dict (from fast5 conversion) should be detected."""
     # The pod5 RunInfo stores context_tags as Dict[str, str]; the converter
@@ -1235,6 +1256,8 @@ def main():
         test_extract_chemistry_fast5_multi_read_tracking_id,
         test_extract_chemistry_pod5_missing_lib,
         test_extract_chemistry_pod5_sample_rate_only,
+        test_classify_chemistry_sample_rate_6khz_promethion,
+        test_classify_chemistry_sample_rate_3khz,
         test_extract_chemistry_pod5_context_tags_fallback,
         test_classify_chemistry_r10_5khz,
         test_classify_chemistry_r9,

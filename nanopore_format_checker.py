@@ -526,14 +526,15 @@ def classify_chemistry(chemistry: dict) -> dict:
     if pore == "unknown" and kit:
         pore = KIT_PORE.get(kit, "unknown")
     # Last resort: infer from sample rate when both flowcell and kit are truly
-    # absent (empty strings, not unrecognized codes). 4kHz was exclusively
-    # R9.4.1 on MinION/PromethION before R10.4.1 shipped (late 2022); 5kHz is
-    # exclusively R10.4.1+.
+    # absent (empty strings, not unrecognized codes).  Only runs with zero
+    # metadata reach this path -- overwhelmingly pre-2020 R9.4.1 data.
+    # PromethION R9.4.1 used 6 kHz sampling in 2018-2019, so any rate other
+    # than exactly 5000 Hz (exclusive to R10.4.1) is assumed R9.4.1.
     if pore == "unknown" and not flowcell and not kit and sample_rate > 0:
-        if sample_rate == 4000:
-            pore = "R9.4.1"
-        elif sample_rate >= 5000:
+        if sample_rate == 5000:
             pore = "R10.4.1"
+        else:
+            pore = "R9.4.1"
     analyte = "rna" if kit.startswith("SQK-RNA") else "dna"
 
     dorado_version = None
