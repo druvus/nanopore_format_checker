@@ -726,20 +726,22 @@ def print_conversion_help(fmt: str):
     """Print conversion instructions for a given format."""
     if fmt == "multi_read_fast5":
         print("  Conversion options:")
-        print("    → To pod5:          pod5 convert fast5 input.fast5 --output output.pod5")
-        print("                        pod5 convert fast5 ./fast5_dir/ --output ./pod5_dir/")
+        print("    -> To pod5:         pod5 convert fast5 ./fast5_dir/ --output ./pod5_dir/ --threads 1 --recursive")
         print("                        # https://github.com/nanoporetech/pod5-file-format")
-        print("    → To single_fast5:  multi_to_single_fast5 --input_path multi/ --save_path single/")
+        print("    -> To single_fast5: multi_to_single_fast5 --input_path multi/ --save_path single/")
         print("                        # https://github.com/nanoporetech/ont_fast5_api")
     elif fmt == "single_read_fast5":
         print("  Conversion options:")
-        print("    → To pod5:          pod5 convert fast5 ./fast5_dir/ --output ./pod5_dir/")
-        print("    → To multi_fast5:   single_to_multi_fast5 --input_path single/ --save_path multi/")
+        print("    -> To pod5 (two steps required):")
+        print("       1. single_to_multi_fast5 -i single_dir/ -s multi_dir/ -t 4 --recursive")
+        print("       2. pod5 convert fast5 multi_dir/ --output pod5_dir/ --threads 1 --recursive")
+        print("       # single-read fast5 must first be merged to multi-read format")
+        print("    -> To multi_fast5:  single_to_multi_fast5 -i single_dir/ -s multi_dir/ -t 4 --recursive")
     elif fmt == "pod5":
         print("  Conversion options:")
-        print("    → To fast5:         pod5 convert to_fast5 input.pod5 --output ./fast5_dir/")
-        print("    → Inspect:          pod5 inspect reads input.pod5")
-        print("    → Merge:            pod5 merge output.pod5 input1.pod5 input2.pod5")
+        print("    -> To fast5:        pod5 convert to_fast5 input.pod5 --output ./fast5_dir/")
+        print("    -> Inspect:         pod5 inspect reads input.pod5")
+        print("    -> Merge:           pod5 merge output.pod5 input1.pod5 input2.pod5")
 
 
 def generate_conversion_script(runs: dict, target_format: str, output_dir: str = "converted"):
@@ -757,25 +759,83 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str =
             if fmt == target_format:
                 continue  # Already in target format
 
-            if target_format == "pod5" and fmt in ("multi_read_fast5", "single_read_fast5"):
+            if target_format == "pod5" and fmt == "multi_read_fast5":
                 dirs = info["details"].get(fmt, {}).get("directories", [])
                 for d in dirs:
                     out = os.path.join(os.path.dirname(d), "pod5")
-                    lines.append(f"echo 'Converting {run_name} ({fmt} → pod5)...'")
+                    lines.append(f"echo 'Converting {run_name} ({fmt} -> pod5)...'")
                     lines.append(f"mkdir -p '{out}'")
-                    lines.append(f"pod5 convert fast5 '{d}/' --output '{out}/' --threads 4")
+                    lines.append(f"pod5 convert fast5 '{d}/' --output '{out}/' --threads 1 --recursive")
+                    lines.append("")
+
+            elif target_format == "pod5" and fmt == "single_read_fast5":
+                dirs = info["details"].get(fmt, {}).get("directories", [])
+                for d in dirs:
+                    multi_tmp = os.path.join(os.path.dirname(d), "multi_fast5_tmp")
+                    out = os.path.join(os.path.dirname(d), "pod5")
+                    lines.append(f"echo 'Converting {run_name} ({fmt} -> pod5, two steps)...'")
+                    lines.append(f"mkdir -p '{multi_tmp}'")
+                    lines.append(f"single_to_multi_fast5 -i '{d}' -s '{multi_tmp}' -t 4 --recursive")
+                    lines.append(f"mkdir -p '{out}'")
+                    lines.append(f"pod5 convert fast5 '{multi_tmp}/' --output '{out}/' --threads 1 --recursive")
+                    lines.append(f"# intermediate multi-read fast5 kept in '{multi_tmp}' -- remove manually if no longer needed")
                     lines.append("")
 
             elif target_format == "single_fast5" and fmt == "multi_read_fast5":
                 dirs = info["details"].get(fmt, {}).get("directories", [])
                 for d in dirs:
                     out = os.path.join(os.path.dirname(d), "single_fast5")
-                    lines.append(f"echo 'Converting {run_name} ({fmt} → single_fast5)...'")
+                    lines.append(f"echo 'Converting {run_name} ({fmt} -> single_fast5)...'")
                     lines.append(f"mkdir -p '{out}'")
                     lines.append(f"multi_to_single_fast5 --input_path '{d}' --save_path '{out}'")
                     lines.append("")
 
     return "\n".join(lines)
+
+
+def write_stats_tsv(all_runs: dict, output_path: str) -> None:
+    """Write per-run statistics to a TSV file.
+
+    Produces one row per format per run, so a run containing both pod5 and
+    fastq output generates two rows.
+
+    Columns: run_name, format, file_count, data_size_bytes, size_estimated,
+    directories, notes
+    """
+    header = ["run_name", "format", "file_count", "data_size_bytes",
+              "size_estimated", "directories", "notes"]
+    with open(output_path, "w") as fh:
+        fh.write("\t".join(header) + "\n")
+        for run_name, info in all_runs.items():
+            for fmt in info["formats"]:
+                detail = info["details"].get(fmt, {})
+                file_count = detail.get("file_count", "")
+                data_size = detail.get("data_size_bytes", "")
+                estimated = detail.get("size_estimated", "")
+                if estimated is True:
+                    estimated = "True"
+                elif estimated is False or estimated == "":
+                    estimated = ""
+                dirs = ";".join(detail.get("directories", []))
+                # Aggregate notes from multiple fields
+                notes_parts = []
+                if detail.get("note"):
+                    notes_parts.append(detail["note"])
+                for reason in detail.get("reasons", []):
+                    notes_parts.append(reason)
+                for af in detail.get("archive_files", []):
+                    notes_parts.append(f"archive: {af}")
+                notes = "; ".join(notes_parts)
+                row = [
+                    run_name,
+                    fmt,
+                    str(file_count),
+                    str(data_size),
+                    str(estimated),
+                    dirs,
+                    notes,
+                ]
+                fh.write("\t".join(row) + "\n")
 
 
 def main():
@@ -805,6 +865,12 @@ def main():
         "--quick",
         action="store_true",
         help="Skip file counting and size calculation; only report format classification",
+    )
+    parser.add_argument(
+        "--output-stats", "-o",
+        default=None,
+        metavar="FILE",
+        help="Write per-run statistics to a TSV file",
     )
     args = parser.parse_args()
 
@@ -962,6 +1028,10 @@ def main():
         script_path.chmod(0o755)
         print(f"\nConversion script written to: {script_path}")
         print(f"  Review and run: bash {script_path}")
+
+    if args.output_stats:
+        write_stats_tsv(all_runs, args.output_stats)
+        print(f"\nStatistics written to: {args.output_stats}")
 
 
 if __name__ == "__main__":

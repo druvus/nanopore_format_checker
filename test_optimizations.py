@@ -14,6 +14,8 @@ from pathlib import Path
 
 # Import the checker module from the same directory
 sys.path.insert(0, str(Path(__file__).parent))
+import io
+
 from nanopore_format_checker import (
     _has_file_with_ext,
     analyze_run,
@@ -24,6 +26,9 @@ from nanopore_format_checker import (
     fast_count_files,
     find_named_subdirs,
     format_size,
+    generate_conversion_script,
+    print_conversion_help,
+    write_stats_tsv,
 )
 
 
@@ -552,6 +557,129 @@ def test_single_read_fast5_root_has_size(tmp_path: Path) -> None:
     print("  PASS: single_read_fast5 in root has size")
 
 
+def test_write_stats_tsv_basic(tmp_path: Path) -> None:
+    """Verify TSV output contains correct header and row values."""
+    all_runs = {
+        "20240101_run_pod5": {
+            "formats": ["pod5"],
+            "details": {
+                "pod5": {
+                    "file_count": 10,
+                    "data_size_bytes": 50000000,
+                    "directories": ["/data/run/pod5"],
+                    "note": "All good",
+                }
+            },
+        }
+    }
+    tsv_path = str(tmp_path / "stats.tsv")
+    write_stats_tsv(all_runs, tsv_path)
+
+    with open(tsv_path) as fh:
+        lines = fh.readlines()
+    assert len(lines) == 2, f"Expected 2 lines (header + 1 row), got {len(lines)}"
+    header = lines[0].strip().split("\t")
+    assert header == ["run_name", "format", "file_count", "data_size_bytes",
+                      "size_estimated", "directories", "notes"]
+    row = lines[1].strip().split("\t")
+    assert row[0] == "20240101_run_pod5"
+    assert row[1] == "pod5"
+    assert row[2] == "10"
+    assert row[3] == "50000000"
+    assert row[5] == "/data/run/pod5"
+    assert "All good" in row[6]
+    print("  PASS: write_stats_tsv basic")
+
+
+def test_write_stats_tsv_multi_format_run(tmp_path: Path) -> None:
+    """Run with pod5 + fastq should produce two rows."""
+    all_runs = {
+        "20240101_run_mixed": {
+            "formats": ["pod5", "fastq"],
+            "details": {
+                "pod5": {
+                    "file_count": 5,
+                    "data_size_bytes": 1000,
+                    "directories": ["/data/run/pod5"],
+                },
+                "fastq": {
+                    "file_count": 3,
+                    "data_size_bytes": 500,
+                    "directories": ["/data/run/fastq_pass"],
+                },
+            },
+        }
+    }
+    tsv_path = str(tmp_path / "stats_multi.tsv")
+    write_stats_tsv(all_runs, tsv_path)
+
+    with open(tsv_path) as fh:
+        lines = fh.readlines()
+    assert len(lines) == 3, f"Expected 3 lines (header + 2 rows), got {len(lines)}"
+    row1 = lines[1].strip().split("\t")
+    row2 = lines[2].strip().split("\t")
+    assert row1[1] == "pod5"
+    assert row2[1] == "fastq"
+    print("  PASS: write_stats_tsv multi-format run")
+
+
+def test_generate_conversion_single_to_pod5(tmp_path: Path) -> None:
+    """single_read_fast5 -> pod5 should produce a two-step script."""
+    runs = {
+        "20240101_run_single": {
+            "formats": ["single_read_fast5"],
+            "details": {
+                "single_read_fast5": {
+                    "directories": ["/data/run/fast5"],
+                }
+            },
+        }
+    }
+    script = generate_conversion_script(runs, "pod5")
+    assert "single_to_multi_fast5" in script, "Should contain single_to_multi_fast5 step"
+    assert "pod5 convert fast5" in script, "Should contain pod5 convert step"
+    assert "multi_fast5_tmp" in script, "Should use multi_fast5_tmp intermediate dir"
+    assert "--threads 1" in script, "Should use --threads 1"
+    assert "two steps" in script, "Should mention two steps"
+    print("  PASS: generate_conversion_script single_read_fast5 -> pod5")
+
+
+def test_generate_conversion_multi_to_pod5(tmp_path: Path) -> None:
+    """multi_read_fast5 -> pod5 should produce a direct conversion."""
+    runs = {
+        "20240101_run_multi": {
+            "formats": ["multi_read_fast5"],
+            "details": {
+                "multi_read_fast5": {
+                    "directories": ["/data/run/fast5"],
+                }
+            },
+        }
+    }
+    script = generate_conversion_script(runs, "pod5")
+    assert "pod5 convert fast5" in script, "Should contain pod5 convert"
+    assert "--threads 1" in script, "Should use --threads 1"
+    assert "--recursive" in script, "Should use --recursive"
+    assert "single_to_multi_fast5" not in script, "Should NOT contain single_to_multi_fast5"
+    print("  PASS: generate_conversion_script multi_read_fast5 -> pod5")
+
+
+def test_print_conversion_help_single_fast5(tmp_path: Path) -> None:
+    """Conversion help for single_read_fast5 should mention two steps."""
+    captured = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = captured
+    try:
+        print_conversion_help("single_read_fast5")
+    finally:
+        sys.stdout = old_stdout
+    output = captured.getvalue()
+    assert "two steps" in output.lower(), f"Should mention 'two steps', got: {output}"
+    assert "single_to_multi_fast5" in output, f"Should mention single_to_multi_fast5, got: {output}"
+    assert "pod5 convert fast5" in output, f"Should mention pod5 convert fast5, got: {output}"
+    print("  PASS: print_conversion_help single_read_fast5")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -593,6 +721,11 @@ def main():
         test_estimate_dir_size_recursive,
         test_single_read_fast5_has_size,
         test_single_read_fast5_root_has_size,
+        test_write_stats_tsv_basic,
+        test_write_stats_tsv_multi_format_run,
+        test_generate_conversion_single_to_pod5,
+        test_generate_conversion_multi_to_pod5,
+        test_print_conversion_help_single_fast5,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:
