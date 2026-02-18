@@ -664,6 +664,58 @@ def test_generate_conversion_multi_to_pod5(tmp_path: Path) -> None:
     print("  PASS: generate_conversion_script multi_read_fast5 -> pod5")
 
 
+def test_generate_conversion_with_output_dir(tmp_path: Path) -> None:
+    """Conversion script with --output-dir writes to <output_dir>/<run_name>/<format>/."""
+    runs = {
+        "20240101_run_multi": {
+            "formats": ["multi_read_fast5"],
+            "details": {
+                "multi_read_fast5": {
+                    "directories": ["/readonly/storage/20240101_run_multi/fast5"],
+                }
+            },
+        },
+        "20240101_run_single": {
+            "formats": ["single_read_fast5"],
+            "details": {
+                "single_read_fast5": {
+                    "directories": ["/readonly/storage/20240101_run_single/fast5"],
+                }
+            },
+        },
+    }
+    script = generate_conversion_script(runs, "pod5", output_dir="/scratch/converted")
+    # Multi-read output should go to output_dir/run_name/pod5
+    assert "/scratch/converted/20240101_run_multi/pod5" in script
+    # Single-read intermediate should go to output_dir/run_name/multi_fast5_tmp
+    assert "/scratch/converted/20240101_run_single/multi_fast5_tmp" in script
+    assert "/scratch/converted/20240101_run_single/pod5" in script
+    # Should NOT reference any path under /readonly/storage for output
+    for line in script.splitlines():
+        if line.startswith("mkdir") or line.startswith("pod5 convert") or line.startswith("single_to_multi"):
+            if "--output" in line or "-s " in line or "mkdir" in line:
+                assert "/readonly/storage" not in line or "-i " in line or "convert fast5" in line.split("--output")[0], \
+                    f"Output path should not be under readonly storage: {line}"
+    print("  PASS: generate_conversion_script with --output-dir")
+
+
+def test_generate_conversion_without_output_dir(tmp_path: Path) -> None:
+    """Without --output-dir, output goes alongside originals (backward compat)."""
+    runs = {
+        "20240101_run_multi": {
+            "formats": ["multi_read_fast5"],
+            "details": {
+                "multi_read_fast5": {
+                    "directories": ["/data/20240101_run_multi/fast5"],
+                }
+            },
+        },
+    }
+    script = generate_conversion_script(runs, "pod5")
+    assert "/data/20240101_run_multi/pod5" in script
+    print("  PASS: generate_conversion_script without --output-dir")
+
+
 def test_print_conversion_help_single_fast5(tmp_path: Path) -> None:
     """Conversion help for single_read_fast5 should mention two steps."""
     captured = io.StringIO()
@@ -725,6 +777,8 @@ def main():
         test_write_stats_tsv_multi_format_run,
         test_generate_conversion_single_to_pod5,
         test_generate_conversion_multi_to_pod5,
+        test_generate_conversion_with_output_dir,
+        test_generate_conversion_without_output_dir,
         test_print_conversion_help_single_fast5,
     ]
 

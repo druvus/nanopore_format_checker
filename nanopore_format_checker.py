@@ -744,8 +744,12 @@ def print_conversion_help(fmt: str):
         print("    -> Merge:           pod5 merge output.pod5 input1.pod5 input2.pod5")
 
 
-def generate_conversion_script(runs: dict, target_format: str, output_dir: str = "converted"):
-    """Generate a bash conversion script."""
+def generate_conversion_script(runs: dict, target_format: str, output_dir: str | None = None):
+    """Generate a bash conversion script.
+
+    When output_dir is provided, all converted files are written under
+    <output_dir>/<run_name>/<format>/ instead of alongside the originals.
+    """
     lines = [
         "#!/usr/bin/env bash",
         "# Auto-generated nanopore format conversion script",
@@ -762,7 +766,10 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str =
             if target_format == "pod5" and fmt == "multi_read_fast5":
                 dirs = info["details"].get(fmt, {}).get("directories", [])
                 for d in dirs:
-                    out = os.path.join(os.path.dirname(d), "pod5")
+                    if output_dir:
+                        out = os.path.join(output_dir, run_name, "pod5")
+                    else:
+                        out = os.path.join(os.path.dirname(d), "pod5")
                     lines.append(f"echo 'Converting {run_name} ({fmt} -> pod5)...'")
                     lines.append(f"mkdir -p '{out}'")
                     lines.append(f"pod5 convert fast5 '{d}/' --output '{out}/' --threads 1 --recursive")
@@ -771,8 +778,12 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str =
             elif target_format == "pod5" and fmt == "single_read_fast5":
                 dirs = info["details"].get(fmt, {}).get("directories", [])
                 for d in dirs:
-                    multi_tmp = os.path.join(os.path.dirname(d), "multi_fast5_tmp")
-                    out = os.path.join(os.path.dirname(d), "pod5")
+                    if output_dir:
+                        base = os.path.join(output_dir, run_name)
+                    else:
+                        base = os.path.dirname(d)
+                    multi_tmp = os.path.join(base, "multi_fast5_tmp")
+                    out = os.path.join(base, "pod5")
                     lines.append(f"echo 'Converting {run_name} ({fmt} -> pod5, two steps)...'")
                     lines.append(f"mkdir -p '{multi_tmp}'")
                     lines.append(f"single_to_multi_fast5 -i '{d}' -s '{multi_tmp}' -t 4 --recursive")
@@ -784,7 +795,10 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str =
             elif target_format == "single_fast5" and fmt == "multi_read_fast5":
                 dirs = info["details"].get(fmt, {}).get("directories", [])
                 for d in dirs:
-                    out = os.path.join(os.path.dirname(d), "single_fast5")
+                    if output_dir:
+                        out = os.path.join(output_dir, run_name, "single_fast5")
+                    else:
+                        out = os.path.join(os.path.dirname(d), "single_fast5")
                     lines.append(f"echo 'Converting {run_name} ({fmt} -> single_fast5)...'")
                     lines.append(f"mkdir -p '{out}'")
                     lines.append(f"multi_to_single_fast5 --input_path '{d}' --save_path '{out}'")
@@ -855,6 +869,12 @@ def main():
         "--script-output",
         default="convert_runs.sh",
         help="Output path for generated conversion script (default: convert_runs.sh)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        metavar="DIR",
+        help="Base output directory for converted files (default: alongside originals)",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -1022,7 +1042,7 @@ def main():
 
     # Generate conversion script if requested
     if args.convert_to:
-        script = generate_conversion_script(all_runs, args.convert_to)
+        script = generate_conversion_script(all_runs, args.convert_to, args.output_dir)
         script_path = Path(args.script_output)
         script_path.write_text(script)
         script_path.chmod(0o755)
