@@ -642,29 +642,32 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
     if all_fast5_dirs:
         unreadable_fast5 = [str(d) for d in all_fast5_dirs if not _is_dir_readable(d)]
 
-        # Sample a fast5 file using os.scandir — also peek into numeric subdirs (0/, 1/, ...)
+        # Sample a fast5 file using os.scandir — also peek into subdirs (numeric 0/1/..., barcode01/, etc.)
         sample_file = None
-        has_numeric_subdirs = False
+        has_subdirs = False
         for d in all_fast5_dirs:
             if str(d) in unreadable_fast5:
                 continue
             try:
+                subdirs = []
                 with os.scandir(d) as it:
                     for entry in it:
-                        if sample_file is None and entry.is_file(follow_symlinks=False) and entry.name.endswith(".fast5"):
+                        if entry.is_file(follow_symlinks=False) and entry.name.endswith(".fast5"):
                             sample_file = Path(entry.path)
                             break
-                        elif entry.is_dir(follow_symlinks=False) and re.match(r"^\d+$", entry.name):
-                            has_numeric_subdirs = True
-                            if sample_file is None:
-                                try:
-                                    with os.scandir(entry.path) as sub_it:
-                                        for sub_entry in sub_it:
-                                            if sub_entry.is_file(follow_symlinks=False) and sub_entry.name.endswith(".fast5"):
-                                                sample_file = Path(sub_entry.path)
-                                                break
-                                except PermissionError:
-                                    pass
+                        elif entry.is_dir(follow_symlinks=False):
+                            has_subdirs = True
+                            subdirs.append(entry.path)
+                if sample_file is None:
+                    for subdir in subdirs:
+                        try:
+                            with os.scandir(subdir) as sub_it:
+                                for sub_entry in sub_it:
+                                    if sub_entry.is_file(follow_symlinks=False) and sub_entry.name.endswith(".fast5"):
+                                        sample_file = Path(sub_entry.path)
+                                        break
+                        except PermissionError:
+                            pass
                         if sample_file is not None:
                             break
             except PermissionError:
@@ -694,8 +697,8 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
                     fast5_info["data_size_bytes"] = total_size
                     if is_estimated:
                         fast5_info["size_estimated"] = True
-                if has_numeric_subdirs:
-                    fast5_info["note"] = "fast5/ contains numeric subdirs with single-read files"
+                if has_subdirs:
+                    fast5_info["note"] = "fast5/ contains subdirs with single-read files"
                 else:
                     fast5_info["note"] = "fast5/ contains single-read files"
                 result["formats"].append("single_read_fast5")

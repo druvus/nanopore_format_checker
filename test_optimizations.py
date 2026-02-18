@@ -240,7 +240,7 @@ def test_fast5_with_numeric_subdirs(tmp_path: Path) -> None:
 
     result = analyze_run(run)
     assert "single_read_fast5" in result["formats"], f"Expected single_read_fast5, got {result['formats']}"
-    assert "numeric subdirs" in result["details"]["single_read_fast5"].get("note", "")
+    assert "subdirs" in result["details"]["single_read_fast5"].get("note", "")
     print("  PASS: fast5/ with numeric subdirs")
 
 
@@ -893,6 +893,45 @@ def test_pod5_barcoded_chemistry(tmp_path: Path) -> None:
     print("  PASS: pod5 barcoded chemistry lookup")
 
 
+def test_fast5_barcoded_sampling(tmp_path: Path) -> None:
+    """Fast5 files inside barcode subdirs should be sampled and classified correctly."""
+    run = tmp_path / "20210415_FAP92655_barcoded_fast5"
+    bc_dir = run / "fast5_pass" / "barcode13"
+    bc_dir.mkdir(parents=True)
+    # Create small files -> single_read_fast5
+    for i in range(3):
+        make_file(bc_dir / f"read_{i}.fast5", size=10_000)
+    # Add a second barcode dir
+    bc2_dir = run / "fast5_pass" / "barcode14"
+    bc2_dir.mkdir()
+    make_file(bc2_dir / "read_0.fast5", size=10_000)
+
+    result = analyze_run(run)
+    assert "single_read_fast5" in result["formats"], (
+        f"Expected single_read_fast5 for barcoded layout, got {result['formats']}"
+    )
+    detail = result["details"]["single_read_fast5"]
+    assert "subdirs" in detail.get("note", ""), (
+        f"Note should mention subdirs, got: {detail.get('note', '')}"
+    )
+    print("  PASS: fast5 barcoded sampling")
+
+
+def test_fast5_barcoded_multi_read(tmp_path: Path) -> None:
+    """Multi-read fast5 inside barcode subdirs should be classified as multi_read_fast5."""
+    run = tmp_path / "20210415_FAP92655_barcoded_multi"
+    bc_dir = run / "fast5_pass" / "barcode01"
+    bc_dir.mkdir(parents=True)
+    # Create large files -> multi_read_fast5
+    make_file(bc_dir / "batch_0.fast5", size=5_000_000)
+
+    result = analyze_run(run)
+    assert "multi_read_fast5" in result["formats"], (
+        f"Expected multi_read_fast5 for barcoded layout, got {result['formats']}"
+    )
+    print("  PASS: fast5 barcoded multi-read sampling")
+
+
 def test_extract_chemistry_fast5_tracking_id_fallback(tmp_path: Path) -> None:
     """Extract chemistry when context_tags/flowcell_type is empty but tracking_id has it."""
     f5 = tmp_path / "20240101_chem_trk" / "read.fast5"
@@ -1064,6 +1103,8 @@ def main():
         test_classify_chemistry_hd_flowcell,
         test_analyze_run_includes_chemistry,
         test_pod5_barcoded_chemistry,
+        test_fast5_barcoded_sampling,
+        test_fast5_barcoded_multi_read,
         test_tsv_includes_chemistry_columns,
     ]
 
