@@ -449,8 +449,12 @@ def extract_chemistry_fast5(file_path: Path) -> dict | None:
 def extract_chemistry_pod5(file_path: Path) -> dict | None:
     """Extract flowcell chemistry metadata from a pod5 file.
 
-    Reads the RunInfo from the first read. Returns {"flowcell":
-    "FLO-MIN114", "kit": "SQK-LSK114", "sample_rate": 5000} or None.
+    Reads the RunInfo from the first read.  Checks direct fields first,
+    then falls back to context_tags and tracking_id dicts (which may
+    retain metadata from the original fast5 conversion).
+
+    Returns {"flowcell": "FLO-MIN114", "kit": "SQK-LSK114",
+    "sample_rate": 5000} or None.
     """
     if not HAS_POD5:
         return None
@@ -458,15 +462,33 @@ def extract_chemistry_pod5(file_path: Path) -> dict | None:
         with pod5.Reader(file_path) as reader:
             for read in reader.reads():
                 info = read.run_info
-                flowcell = info.flow_cell_product_code or ""
-                kit = info.sequencing_kit or ""
-                sample_rate = info.sample_rate or 0
+                flowcell = (info.flow_cell_product_code or "").upper()
+                kit = (info.sequencing_kit or "").upper()
+                sample_rate = int(info.sample_rate or 0)
+
+                # Fallback: check context_tags dict (may hold fast5 metadata)
+                ctx = info.context_tags or {}
                 if not flowcell:
+                    flowcell = ctx.get("flowcell_type", "").upper()
+                if not kit:
+                    kit = ctx.get("sequencing_kit", "").upper()
+                if not kit:
+                    kit = ctx.get("experiment_kit", "").upper()
+                if sample_rate == 0:
+                    rate_str = ctx.get("sample_frequency", "0")
+                    sample_rate = int(rate_str) if rate_str.isdigit() else 0
+
+                # Fallback: check tracking_id dict
+                trk = info.tracking_id or {}
+                if not flowcell:
+                    flowcell = trk.get("flow_cell_product_code", "").upper()
+
+                if not flowcell and not kit and sample_rate == 0:
                     return None
                 return {
-                    "flowcell": flowcell.upper(),
-                    "kit": kit.upper(),
-                    "sample_rate": int(sample_rate),
+                    "flowcell": flowcell,
+                    "kit": kit,
+                    "sample_rate": sample_rate,
                 }
         return None
     except Exception:

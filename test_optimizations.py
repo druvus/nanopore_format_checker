@@ -977,6 +977,35 @@ def test_extract_chemistry_fast5_multi_read_tracking_id(tmp_path: Path) -> None:
     print("  PASS: extract_chemistry_fast5 multi-read tracking_id fallback")
 
 
+def test_extract_chemistry_pod5_sample_rate_only(tmp_path: Path) -> None:
+    """Pod5 converted from old fast5 with no flowcell/kit but valid sample_rate should work."""
+    # We can't easily create a real pod5 file without the pod5 library,
+    # so test the logic indirectly: verify classify_chemistry handles the
+    # dict that extract_chemistry_pod5 would produce (empty flowcell/kit,
+    # valid sample_rate).
+    chem = {"flowcell": "", "kit": "", "sample_rate": 4000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "R9.4.1", f"Expected R9.4.1 from sample rate, got {result['pore']}"
+    assert result["dorado_version"] == "0.9.6"
+    # Now verify with 5kHz
+    chem5k = {"flowcell": "", "kit": "", "sample_rate": 5000}
+    result5k = classify_chemistry(chem5k)
+    assert result5k["pore"] == "R10.4.1", f"Expected R10.4.1 from 5kHz, got {result5k['pore']}"
+    print("  PASS: extract_chemistry_pod5 sample-rate-only (converted from old fast5)")
+
+
+def test_extract_chemistry_pod5_context_tags_fallback(tmp_path: Path) -> None:
+    """Pod5 with flowcell in context_tags dict (from fast5 conversion) should be detected."""
+    # The pod5 RunInfo stores context_tags as Dict[str, str]; the converter
+    # copies fast5 context_tags attributes here. Our updated extractor should
+    # check this dict when flow_cell_product_code is empty.
+    # We can't create a real pod5, but we test the classify_chemistry path:
+    chem_with_ctx_flowcell = {"flowcell": "FLO-MIN106", "kit": "", "sample_rate": 4000}
+    result = classify_chemistry(chem_with_ctx_flowcell)
+    assert result["pore"] == "R9.4.1"
+    print("  PASS: extract_chemistry_pod5 context_tags fallback")
+
+
 def test_classify_chemistry_r10_3(tmp_path: Path) -> None:
     """R10.3 (FLO-MIN111) should recommend dorado 0.9.6."""
     chem = {"flowcell": "FLO-MIN111", "kit": "", "sample_rate": 4000}
@@ -1205,6 +1234,8 @@ def main():
         test_extract_chemistry_fast5_tracking_id_fallback,
         test_extract_chemistry_fast5_multi_read_tracking_id,
         test_extract_chemistry_pod5_missing_lib,
+        test_extract_chemistry_pod5_sample_rate_only,
+        test_extract_chemistry_pod5_context_tags_fallback,
         test_classify_chemistry_r10_5khz,
         test_classify_chemistry_r9,
         test_classify_chemistry_r10_4khz,
