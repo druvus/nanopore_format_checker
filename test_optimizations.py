@@ -640,6 +640,7 @@ def test_generate_conversion_single_to_pod5(tmp_path: Path) -> None:
                 }
             },
             "run_path": "/data/run",
+            "chemistry": None,
         }
     }
     script = generate_conversion_script(runs, "pod5")
@@ -649,6 +650,8 @@ def test_generate_conversion_single_to_pod5(tmp_path: Path) -> None:
     assert "--threads 20" in script, "Should use --threads 20"
     assert "two steps" in script, "Should mention two steps"
     assert "single_to_multi_fast5 -i '/data/run'" in script, "Should use run folder for single_to_multi"
+    # No chemistry -> no metadata patch
+    assert "Patching pod5 metadata" not in script, "Should not patch without chemistry"
     print("  PASS: generate_conversion_script single_read_fast5 -> pod5")
 
 
@@ -724,6 +727,54 @@ def test_generate_conversion_without_output_dir(tmp_path: Path) -> None:
     assert "/data/20240101_run_multi/pod5" in script
     assert "pod5 convert fast5 '/data/20240101_run_multi/'" in script
     print("  PASS: generate_conversion_script without --output-dir")
+
+
+def test_generate_conversion_with_metadata_patch(tmp_path: Path) -> None:
+    """Conversion script should patch pod5 metadata when chemistry is detected."""
+    runs = {
+        "20180501_old_run": {
+            "formats": ["single_read_fast5"],
+            "details": {
+                "single_read_fast5": {
+                    "directories": ["/data/old_run/fast5"],
+                }
+            },
+            "run_path": "/data/old_run",
+            "chemistry": {"flowcell": "FLO-MIN106", "kit": "SQK-LSK109", "sample_rate": 4000},
+        }
+    }
+    script = generate_conversion_script(runs, "pod5")
+    assert "pod5 convert fast5" in script, "Should contain pod5 convert step"
+    assert "Patching pod5 metadata" in script, "Should patch metadata"
+    assert "FLO-MIN106" in script, "Should inject flowcell code"
+    assert "SQK-LSK109" in script, "Should inject kit code"
+    assert "sample_rate = 4000" in script, "Should inject sample_rate"
+    assert "import pod5" in script, "Should use pod5 Python API"
+    assert "PATCH_EOF" in script, "Should use here-document"
+    print("  PASS: generate_conversion_script with metadata patch")
+
+
+def test_generate_conversion_multi_with_metadata_patch(tmp_path: Path) -> None:
+    """Multi-read fast5 -> pod5 should also patch metadata when chemistry is detected."""
+    runs = {
+        "20200101_multi_run": {
+            "formats": ["multi_read_fast5"],
+            "details": {
+                "multi_read_fast5": {
+                    "directories": ["/data/multi/fast5"],
+                }
+            },
+            "run_path": "/data/multi",
+            "chemistry": {"flowcell": "", "kit": "", "sample_rate": 4000},
+        }
+    }
+    script = generate_conversion_script(runs, "pod5")
+    assert "Patching pod5 metadata" in script, "Should patch metadata"
+    assert "sample_rate = 4000" in script, "Should inject sample_rate"
+    # Empty flowcell/kit should not generate assignment lines
+    assert "flow_cell_product_code" not in script, "Should not set empty flowcell"
+    assert "sequencing_kit" not in script, "Should not set empty kit"
+    print("  PASS: generate_conversion_script multi with metadata patch")
 
 
 def test_print_conversion_help_single_fast5(tmp_path: Path) -> None:
@@ -1249,6 +1300,8 @@ def main():
         test_generate_conversion_multi_to_pod5,
         test_generate_conversion_with_output_dir,
         test_generate_conversion_without_output_dir,
+        test_generate_conversion_with_metadata_patch,
+        test_generate_conversion_multi_with_metadata_patch,
         test_print_conversion_help_single_fast5,
         test_extract_chemistry_fast5_single_read,
         test_extract_chemistry_fast5_multi_read,

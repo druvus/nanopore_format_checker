@@ -1106,11 +1106,68 @@ def print_conversion_help(fmt: str):
         print("    -> Merge:           pod5 merge output.pod5 input1.pod5 input2.pod5")
 
 
+def _pod5_metadata_fix_lines(pod5_dir: str, chemistry: dict) -> list[str]:
+    """Generate bash lines that patch pod5 metadata using the pod5 Python API.
+
+    Rewrites each pod5 file in pod5_dir, injecting the detected flowcell,
+    kit, and sample_rate into RunInfo.  This is necessary for old fast5 runs
+    where the converter produces pod5 files with empty or incorrect metadata.
+    """
+    flowcell = chemistry.get("flowcell", "")
+    kit = chemistry.get("kit", "")
+    sample_rate = chemistry.get("sample_rate", 0)
+    if not flowcell and not kit and not sample_rate:
+        return []
+    lines = []
+    lines.append(f"echo '  Patching pod5 metadata (flowcell={flowcell}, kit={kit}, sample_rate={sample_rate})...'")
+    # Use a here-document for the Python script to avoid quoting issues
+    lines.append(f"python3 << 'PATCH_EOF'")
+    lines.append("import shutil, sys")
+    lines.append("from pathlib import Path")
+    lines.append("try:")
+    lines.append("    import pod5")
+    lines.append("except ImportError:")
+    lines.append("    print('Warning: pod5 Python package not installed, skipping metadata patch')")
+    lines.append("    sys.exit(0)")
+    lines.append(f"pod5_dir = Path('{pod5_dir}')")
+    lines.append("files = sorted(pod5_dir.rglob('*.pod5'))")
+    lines.append("if not files:")
+    lines.append("    print('  No pod5 files found to patch')")
+    lines.append("    sys.exit(0)")
+    lines.append(f"print(f'  Patching {{len(files)}} pod5 file(s)...')")
+    lines.append("for p5 in files:")
+    lines.append("    tmp = p5.with_suffix('.pod5.tmp')")
+    lines.append("    try:")
+    lines.append("        with pod5.Reader(p5) as reader:")
+    lines.append("            with pod5.Writer(tmp) as writer:")
+    lines.append("                for record in reader.reads():")
+    lines.append("                    read = record.to_read()")
+    if flowcell:
+        lines.append(f"                    read.run_info.flow_cell_product_code = '{flowcell}'")
+    if kit:
+        lines.append(f"                    read.run_info.sequencing_kit = '{kit}'")
+    if sample_rate:
+        lines.append(f"                    read.run_info.sample_rate = {sample_rate}")
+    lines.append("                    writer.add_read(read)")
+    lines.append("        shutil.move(str(tmp), str(p5))")
+    lines.append("        print(f'  Patched: {p5.name}')")
+    lines.append("    except Exception as e:")
+    lines.append("        print(f'  Warning: failed to patch {p5.name}: {e}')")
+    lines.append("        if tmp.exists():")
+    lines.append("            tmp.unlink()")
+    lines.append("PATCH_EOF")
+    return lines
+
+
 def generate_conversion_script(runs: dict, target_format: str, output_dir: str | None = None):
     """Generate a bash conversion script.
 
     When output_dir is provided, all converted files are written under
     <output_dir>/<run_name>/<format>/ instead of alongside the originals.
+
+    For runs where chemistry was detected from the source fast5, a
+    post-conversion metadata patching step is included to inject the
+    correct flowcell, kit, and sample_rate into the pod5 RunInfo.
     """
     lines = [
         "#!/usr/bin/env bash",
@@ -1134,6 +1191,10 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str |
                 lines.append(f"echo 'Converting {run_name} ({fmt} -> pod5)...'")
                 lines.append(f"mkdir -p '{out}'")
                 lines.append(f"pod5 convert fast5 '{run_path}/' --output '{out}/' --threads 20 --recursive")
+                # Patch metadata if chemistry was detected from source fast5
+                chem = info.get("chemistry")
+                if chem:
+                    lines.extend(_pod5_metadata_fix_lines(out, chem))
                 lines.append("")
 
             elif target_format == "pod5" and fmt == "single_read_fast5":
@@ -1149,6 +1210,10 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str |
                 lines.append(f"single_to_multi_fast5 -i '{run_path}' -s '{multi_tmp}' -t 4 --recursive")
                 lines.append(f"mkdir -p '{out}'")
                 lines.append(f"pod5 convert fast5 '{multi_tmp}/' --output '{out}/' --threads 20 --recursive")
+                # Patch metadata if chemistry was detected from source fast5
+                chem = info.get("chemistry")
+                if chem:
+                    lines.extend(_pod5_metadata_fix_lines(out, chem))
                 lines.append(f"# intermediate multi-read fast5 kept in '{multi_tmp}' -- remove manually if no longer needed")
                 lines.append("")
 
