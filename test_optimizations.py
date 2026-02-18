@@ -869,6 +869,30 @@ def test_analyze_run_includes_chemistry(tmp_path: Path) -> None:
     print("  PASS: analyze_run includes chemistry")
 
 
+def test_pod5_barcoded_chemistry(tmp_path: Path) -> None:
+    """Pod5 files inside barcode subdirs should still yield chemistry."""
+    run = tmp_path / "20240101_run_barcoded_pod5"
+    bc_dir = run / "pod5_pass" / "barcode01"
+    bc_dir.mkdir(parents=True)
+    make_file(bc_dir / "reads_001.pod5", size=5_000_000)
+    # Also add a barcode02 dir so first scandir entry is a directory
+    bc2_dir = run / "pod5_pass" / "barcode02"
+    bc2_dir.mkdir()
+    make_file(bc2_dir / "reads_001.pod5", size=5_000_000)
+
+    result = analyze_run(run)
+    assert "pod5" in result["formats"], f"Expected pod5, got {result['formats']}"
+    # Chemistry will be None since these are fake pod5 files (not readable by pod5 lib),
+    # but the key test is that _find_first_pod5 successfully locates a .pod5 file
+    # inside the barcode subdirectory. We verify this indirectly: no crash, and the
+    # format is detected. For a direct unit test of _find_first_pod5:
+    from nanopore_format_checker import _find_first_pod5
+    found = _find_first_pod5(run / "pod5_pass")
+    assert found is not None, "Should find pod5 inside barcode subdir"
+    assert found.suffix == ".pod5"
+    print("  PASS: pod5 barcoded chemistry lookup")
+
+
 def test_extract_chemistry_fast5_tracking_id_fallback(tmp_path: Path) -> None:
     """Extract chemistry when context_tags/flowcell_type is empty but tracking_id has it."""
     f5 = tmp_path / "20240101_chem_trk" / "read.fast5"
@@ -1039,6 +1063,7 @@ def main():
         test_classify_chemistry_rna_flowcell,
         test_classify_chemistry_hd_flowcell,
         test_analyze_run_includes_chemistry,
+        test_pod5_barcoded_chemistry,
         test_tsv_includes_chemistry_columns,
     ]
 

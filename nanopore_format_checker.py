@@ -513,6 +513,35 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
+def _find_first_pod5(directory: Path) -> Path | None:
+    """Find the first .pod5 file in a directory, descending into one level of subdirs.
+
+    Barcoded runs store pod5 files inside barcode subdirectories
+    (pod5_pass/barcode01/*.pod5), so a flat scan of the pod5 directory
+    may yield only subdirectories. This helper checks the top level first,
+    then peeks into immediate subdirectories.
+    """
+    try:
+        with os.scandir(directory) as it:
+            subdirs = []
+            for entry in it:
+                if entry.is_file(follow_symlinks=False) and entry.name.endswith(".pod5"):
+                    return Path(entry.path)
+                if entry.is_dir(follow_symlinks=False):
+                    subdirs.append(entry.path)
+        for subdir in subdirs:
+            try:
+                with os.scandir(subdir) as it:
+                    for entry in it:
+                        if entry.is_file(follow_symlinks=False) and entry.name.endswith(".pod5"):
+                            return Path(entry.path)
+            except PermissionError:
+                pass
+    except PermissionError:
+        pass
+    return None
+
+
 def analyze_run(run_path: Path, quick: bool = False) -> dict:
     """
     Analyze a nanopore run directory and determine its read format(s).
@@ -600,19 +629,13 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
             for d in all_pod5_dirs:
                 if str(d) in unreadable_pod5:
                     continue
-                try:
-                    with os.scandir(d) as it:
-                        for entry in it:
-                            if entry.is_file(follow_symlinks=False) and entry.name.endswith(".pod5"):
-                                chem = extract_chemistry(Path(entry.path), "pod5")
-                                if chem:
-                                    result["chemistry"] = chem
-                                    result["chemistry_classification"] = classify_chemistry(chem)
-                            break
-                except PermissionError:
-                    pass
-                if result["chemistry"]:
-                    break
+                pod5_file = _find_first_pod5(d)
+                if pod5_file:
+                    chem = extract_chemistry(pod5_file, "pod5")
+                    if chem:
+                        result["chemistry"] = chem
+                        result["chemistry_classification"] = classify_chemistry(chem)
+                        break
 
     # --- Check for fast5 (fast5/ or fast5_skip/fast5_pass/fast5_fail, up to 5 levels down) ---
     all_fast5_dirs = fast5_dirs + fast5_variant_dirs
