@@ -19,10 +19,12 @@ import io
 from nanopore_format_checker import (
     _has_file_with_ext,
     analyze_run,
+    classify_chemistry,
     compute_dir_size,
     diagnose_unknown,
     discover_run_structure,
     estimate_dir_size,
+    extract_chemistry,
     extract_chemistry_fast5,
     extract_chemistry_pod5,
     fast_count_files,
@@ -781,6 +783,62 @@ def test_extract_chemistry_pod5_missing_lib(tmp_path: Path) -> None:
     print("  PASS: extract_chemistry_pod5 missing lib or invalid file")
 
 
+def test_classify_chemistry_r10_5khz(tmp_path: Path) -> None:
+    """R10.4.1 at 5kHz should recommend dorado >=1.0."""
+    chem = {"flowcell": "FLO-MIN114", "kit": "SQK-LSK114", "sample_rate": 5000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "R10.4.1"
+    assert result["dorado_version"] == ">=1.0"
+    assert result["analyte"] == "dna"
+    print("  PASS: classify_chemistry R10.4.1 5kHz")
+
+
+def test_classify_chemistry_r9(tmp_path: Path) -> None:
+    """R9.4.1 should recommend dorado 0.9.6."""
+    chem = {"flowcell": "FLO-MIN106", "kit": "SQK-LSK109", "sample_rate": 4000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "R9.4.1"
+    assert result["dorado_version"] == "0.9.6"
+    assert result["note"] is not None and "0.9.6" in result["note"]
+    print("  PASS: classify_chemistry R9.4.1")
+
+
+def test_classify_chemistry_r10_4khz(tmp_path: Path) -> None:
+    """R10.4.1 at 4kHz (legacy) should recommend dorado 0.9.6."""
+    chem = {"flowcell": "FLO-MIN114", "kit": "SQK-LSK114", "sample_rate": 4000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "R10.4.1"
+    assert result["dorado_version"] == "0.9.6"
+    print("  PASS: classify_chemistry R10.4.1 4kHz")
+
+
+def test_classify_chemistry_rna004(tmp_path: Path) -> None:
+    """RNA004 kit should recommend dorado >=1.0."""
+    chem = {"flowcell": "FLO-MIN114", "kit": "SQK-RNA004", "sample_rate": 4000}
+    result = classify_chemistry(chem)
+    assert result["analyte"] == "rna"
+    assert result["dorado_version"] == ">=1.0"
+    print("  PASS: classify_chemistry RNA004")
+
+
+def test_classify_chemistry_rna002(tmp_path: Path) -> None:
+    """RNA002 kit should recommend dorado 0.9.6."""
+    chem = {"flowcell": "FLO-MIN106", "kit": "SQK-RNA002", "sample_rate": 3000}
+    result = classify_chemistry(chem)
+    assert result["analyte"] == "rna"
+    assert result["dorado_version"] == "0.9.6"
+    print("  PASS: classify_chemistry RNA002")
+
+
+def test_classify_chemistry_unknown(tmp_path: Path) -> None:
+    """Unknown flowcell code should report unknown pore with no version recommendation."""
+    chem = {"flowcell": "FLO-PROTOTYPE", "kit": "SQK-BETA", "sample_rate": 5000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "unknown"
+    assert result["dorado_version"] is None
+    print("  PASS: classify_chemistry unknown flowcell")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -832,6 +890,12 @@ def main():
         test_extract_chemistry_fast5_single_read,
         test_extract_chemistry_fast5_multi_read,
         test_extract_chemistry_pod5_missing_lib,
+        test_classify_chemistry_r10_5khz,
+        test_classify_chemistry_r9,
+        test_classify_chemistry_r10_4khz,
+        test_classify_chemistry_rna004,
+        test_classify_chemistry_rna002,
+        test_classify_chemistry_unknown,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:

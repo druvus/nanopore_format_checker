@@ -366,6 +366,66 @@ def extract_chemistry_pod5(file_path: Path) -> dict | None:
         return None
 
 
+def extract_chemistry(file_path: Path, file_format: str) -> dict | None:
+    """Extract flowcell chemistry from a data file.
+
+    Dispatches to the pod5 or fast5 extractor based on file_format.
+    Returns None on any failure -- chemistry extraction is best-effort.
+    """
+    try:
+        if file_format == "pod5":
+            return extract_chemistry_pod5(file_path)
+        elif file_format in ("fast5", "single_read_fast5", "multi_read_fast5"):
+            return extract_chemistry_fast5(file_path)
+    except Exception:
+        pass
+    return None
+
+
+def classify_chemistry(chemistry: dict) -> dict:
+    """Map raw chemistry metadata to pore type and dorado version recommendation.
+
+    Input: {"flowcell": "FLO-MIN114", "kit": "SQK-LSK114", "sample_rate": 5000}
+    Output: {"pore", "analyte", "dorado_version", "model_hint", "note"}
+    """
+    flowcell = chemistry.get("flowcell", "")
+    kit = chemistry.get("kit", "")
+    sample_rate = chemistry.get("sample_rate", 0)
+
+    pore = FLOWCELL_PORE.get(flowcell, "unknown")
+    analyte = "rna" if kit.startswith("SQK-RNA") else "dna"
+
+    dorado_version = None
+    model_hint = "sup"
+    note = None
+
+    # RNA kit overrides
+    if kit == "SQK-RNA004":
+        dorado_version = ">=1.0"
+        note = None
+    elif kit == "SQK-RNA002":
+        dorado_version = "0.9.6"
+        note = "RNA002 support was dropped in dorado 1.0; use dorado 0.9.6"
+    elif pore == "R9.4.1":
+        dorado_version = "0.9.6"
+        note = "R9.4.1 support was dropped in dorado 1.0; use dorado 0.9.6"
+    elif pore == "R10.4.1":
+        if sample_rate >= 5000:
+            dorado_version = ">=1.0"
+        else:
+            dorado_version = "0.9.6"
+            note = "R10.4.1 at 4kHz requires dorado 0.9.6; 5kHz data supported in >=1.0"
+    # pore == "unknown" -> dorado_version stays None
+
+    return {
+        "pore": pore,
+        "analyte": analyte,
+        "dorado_version": dorado_version,
+        "model_hint": model_hint,
+        "note": note,
+    }
+
+
 def count_files_recursive(directory: Path, ext: str) -> tuple[int, int]:
     """Count files with given extension recursively using fast os.scandir.
 
