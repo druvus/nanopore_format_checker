@@ -63,6 +63,51 @@ FLOWCELL_PORE = {
     "FLO-PRO004RA": "RNA004",
 }
 
+# Fallback: infer pore type from sequencing kit when flowcell product code is
+# absent (common with older MinKNOW versions that did not write
+# flow_cell_product_code).
+KIT_PORE = {
+    # R9.4.1 ligation / rapid / barcoding kits
+    "SQK-LSK109": "R9.4.1",
+    "SQK-LSK109-XL": "R9.4.1",
+    "SQK-RAD004": "R9.4.1",
+    "SQK-RBK004": "R9.4.1",
+    "SQK-RPB004": "R9.4.1",
+    "SQK-PBK004": "R9.4.1",
+    "SQK-PCS109": "R9.4.1",
+    "SQK-PCB109": "R9.4.1",
+    "SQK-DCS109": "R9.4.1",
+    "SQK-CAS109": "R9.4.1",
+    "SQK-CS9109": "R9.4.1",
+    "SQK-NBD112-24": "R9.4.1",
+    "SQK-NBD112-96": "R9.4.1",
+    "SQK-16S024": "R9.4.1",
+    "SQK-16S114-24": "R10.4.1",
+    # Older R9.4.1 kits
+    "SQK-RAD002": "R9.4.1",
+    "SQK-RAD003": "R9.4.1",
+    "SQK-LSK108": "R9.4.1",
+    "SQK-LWP001": "R9.4.1",
+    "SQK-LWB001": "R9.4.1",
+    "SQK-RAS201": "R9.4.1",
+    "SQK-RLB001": "R9.4.1",
+    "VSK-VSK002": "R9.4.1",
+    # R10.4.1 kits
+    "SQK-LSK114": "R10.4.1",
+    "SQK-LSK114-XL": "R10.4.1",
+    "SQK-RAD114": "R10.4.1",
+    "SQK-RBK114-24": "R10.4.1",
+    "SQK-RBK114-96": "R10.4.1",
+    "SQK-NBD114-24": "R10.4.1",
+    "SQK-NBD114-96": "R10.4.1",
+    "SQK-PCS114": "R10.4.1",
+    "SQK-PCB114-24": "R10.4.1",
+    "SQK-ULK114": "R10.4.1",
+    # RNA kits
+    "SQK-RNA002": "RNA002",
+    "SQK-RNA004": "RNA004",
+}
+
 
 def is_nanopore_run_dir(dirname: str) -> bool:
     """Check if directory name matches nanopore run naming convention (starts with date)."""
@@ -368,7 +413,7 @@ def extract_chemistry_fast5(file_path: Path) -> dict | None:
                 rate_str = _decode_attr(trk.attrs.get("sample_frequency", "0"))
                 sample_rate = int(rate_str) if rate_str.isdigit() else 0
 
-            if not flowcell:
+            if not flowcell and not kit and sample_rate == 0:
                 return None
             return {"flowcell": flowcell, "kit": kit, "sample_rate": sample_rate}
     except Exception:
@@ -429,6 +474,9 @@ def classify_chemistry(chemistry: dict) -> dict:
     sample_rate = chemistry.get("sample_rate", 0)
 
     pore = FLOWCELL_PORE.get(flowcell, "unknown")
+    # Fallback: infer pore type from kit when flowcell code is absent
+    if pore == "unknown" and kit:
+        pore = KIT_PORE.get(kit, "unknown")
     analyte = "rna" if kit.startswith("SQK-RNA") else "dna"
 
     dorado_version = None
