@@ -290,11 +290,53 @@ def classify_fast5_by_size(fast5_file: Path) -> str:
 def classify_fast5(fast5_file: Path) -> str:
     """
     Determine if a fast5 file is single-read or multi-read.
-    
+
     Uses file size heuristic for speed - single-read files are typically <1MB,
     multi-read files are typically >1MB.
     """
     return classify_fast5_by_size(fast5_file)
+
+
+def _decode_attr(val):
+    """Decode an HDF5 attribute value to a string."""
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace")
+    return str(val)
+
+
+def extract_chemistry_fast5(file_path: Path) -> dict | None:
+    """Extract flowcell chemistry metadata from a fast5 file.
+
+    Reads context_tags attributes from the HDF5 file. Handles both
+    single-read (UniqueGlobalKey/context_tags) and multi-read
+    (<read_id>/context_tags) layouts.
+
+    Returns {"flowcell": "FLO-MIN114", "kit": "SQK-LSK114",
+    "sample_rate": 5000} or None on failure.
+    """
+    if not HAS_H5PY:
+        return None
+    try:
+        with h5py.File(file_path, "r") as f:
+            ctx = None
+            if "UniqueGlobalKey" in f and "context_tags" in f["UniqueGlobalKey"]:
+                ctx = f["UniqueGlobalKey/context_tags"]
+            else:
+                for key in f.keys():
+                    if "context_tags" in f[key]:
+                        ctx = f[f"{key}/context_tags"]
+                        break
+            if ctx is None:
+                return None
+            flowcell = _decode_attr(ctx.attrs.get("flowcell_type", "")).upper()
+            kit = _decode_attr(ctx.attrs.get("sequencing_kit", "")).upper()
+            rate_str = _decode_attr(ctx.attrs.get("sample_frequency", "0"))
+            sample_rate = int(rate_str) if rate_str.isdigit() else 0
+            if not flowcell:
+                return None
+            return {"flowcell": flowcell, "kit": kit, "sample_rate": sample_rate}
+    except Exception:
+        return None
 
 
 def count_files_recursive(directory: Path, ext: str) -> tuple[int, int]:

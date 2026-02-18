@@ -23,6 +23,7 @@ from nanopore_format_checker import (
     diagnose_unknown,
     discover_run_structure,
     estimate_dir_size,
+    extract_chemistry_fast5,
     fast_count_files,
     find_named_subdirs,
     format_size,
@@ -732,6 +733,42 @@ def test_print_conversion_help_single_fast5(tmp_path: Path) -> None:
     print("  PASS: print_conversion_help single_read_fast5")
 
 
+def test_extract_chemistry_fast5_single_read(tmp_path: Path) -> None:
+    """Extract chemistry from a single-read fast5 file."""
+    f5 = tmp_path / "20240101_chem_sr" / "read.fast5"
+    f5.parent.mkdir(parents=True)
+    import h5py
+    with h5py.File(f5, "w") as f:
+        ctx = f.create_group("UniqueGlobalKey/context_tags")
+        ctx.attrs["flowcell_type"] = "flo-min106"
+        ctx.attrs["sequencing_kit"] = "sqk-lsk109"
+        ctx.attrs["sample_frequency"] = "4000"
+    result = extract_chemistry_fast5(f5)
+    assert result is not None
+    assert result["flowcell"] == "FLO-MIN106"
+    assert result["kit"] == "SQK-LSK109"
+    assert result["sample_rate"] == 4000
+    print("  PASS: extract_chemistry_fast5 single-read")
+
+
+def test_extract_chemistry_fast5_multi_read(tmp_path: Path) -> None:
+    """Extract chemistry from a multi-read fast5 file."""
+    f5 = tmp_path / "20240101_chem_mr" / "read.fast5"
+    f5.parent.mkdir(parents=True)
+    import h5py
+    with h5py.File(f5, "w") as f:
+        ctx = f.create_group("read_001/context_tags")
+        ctx.attrs["flowcell_type"] = "flo-min114"
+        ctx.attrs["sequencing_kit"] = "sqk-lsk114"
+        ctx.attrs["sample_frequency"] = "5000"
+    result = extract_chemistry_fast5(f5)
+    assert result is not None
+    assert result["flowcell"] == "FLO-MIN114"
+    assert result["kit"] == "SQK-LSK114"
+    assert result["sample_rate"] == 5000
+    print("  PASS: extract_chemistry_fast5 multi-read")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -780,6 +817,8 @@ def main():
         test_generate_conversion_with_output_dir,
         test_generate_conversion_without_output_dir,
         test_print_conversion_help_single_fast5,
+        test_extract_chemistry_fast5_single_read,
+        test_extract_chemistry_fast5_multi_read,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:
