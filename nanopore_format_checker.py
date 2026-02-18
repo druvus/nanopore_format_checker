@@ -380,20 +380,23 @@ def extract_chemistry_fast5(file_path: Path) -> dict | None:
         with h5py.File(file_path, "r") as f:
             ctx = None
             trk = None
-            chan = None  # channel_id group (last resort for sampling_rate)
+
             if "UniqueGlobalKey" in f:
                 if "context_tags" in f["UniqueGlobalKey"]:
                     ctx = f["UniqueGlobalKey/context_tags"]
                 if "tracking_id" in f["UniqueGlobalKey"]:
                     trk = f["UniqueGlobalKey/tracking_id"]
             else:
-                for key in f.keys():
-                    if ctx is None and "context_tags" in f[key]:
-                        ctx = f[f"{key}/context_tags"]
-                    if trk is None and "tracking_id" in f[key]:
-                        trk = f[f"{key}/tracking_id"]
-                    if chan is None and "channel_id" in f[key]:
-                        chan = f[f"{key}/channel_id"]
+                # Multi-read layout: check first few reads for metadata groups
+                for key in list(f.keys())[:5]:
+                    try:
+                        grp = f[key]
+                        if ctx is None and "context_tags" in grp:
+                            ctx = grp["context_tags"]
+                        if trk is None and "tracking_id" in grp:
+                            trk = grp["tracking_id"]
+                    except Exception:
+                        continue
                     if ctx is not None and trk is not None:
                         break
 
@@ -422,12 +425,17 @@ def extract_chemistry_fast5(file_path: Path) -> dict | None:
             # Last resort: get sampling_rate from channel_id group (older
             # multi-read fast5 files that lack context_tags/tracking_id
             # entirely).  channel_id/sampling_rate is a float (e.g. 4000.0).
-            if sample_rate == 0 and chan is not None:
-                raw_rate = chan.attrs.get("sampling_rate", 0)
-                try:
-                    sample_rate = int(float(raw_rate))
-                except (ValueError, TypeError):
-                    pass
+            if sample_rate == 0:
+                for key in list(f.keys())[:5]:
+                    try:
+                        grp = f[key]
+                        if "channel_id" in grp:
+                            raw_rate = grp["channel_id"].attrs.get("sampling_rate", 0)
+                            sample_rate = int(float(raw_rate))
+                            if sample_rate > 0:
+                                break
+                    except Exception:
+                        continue
 
             if not flowcell and not kit and sample_rate == 0:
                 return None
