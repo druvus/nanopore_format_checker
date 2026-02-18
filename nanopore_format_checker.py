@@ -380,6 +380,7 @@ def extract_chemistry_fast5(file_path: Path) -> dict | None:
         with h5py.File(file_path, "r") as f:
             ctx = None
             trk = None
+            chan = None  # channel_id group (last resort for sampling_rate)
             if "UniqueGlobalKey" in f:
                 if "context_tags" in f["UniqueGlobalKey"]:
                     ctx = f["UniqueGlobalKey/context_tags"]
@@ -391,6 +392,8 @@ def extract_chemistry_fast5(file_path: Path) -> dict | None:
                         ctx = f[f"{key}/context_tags"]
                     if trk is None and "tracking_id" in f[key]:
                         trk = f[f"{key}/tracking_id"]
+                    if chan is None and "channel_id" in f[key]:
+                        chan = f[f"{key}/channel_id"]
                     if ctx is not None and trk is not None:
                         break
 
@@ -415,6 +418,16 @@ def extract_chemistry_fast5(file_path: Path) -> dict | None:
             if sample_rate == 0 and trk is not None:
                 rate_str = _decode_attr(trk.attrs.get("sample_frequency", "0"))
                 sample_rate = int(rate_str) if rate_str.isdigit() else 0
+
+            # Last resort: get sampling_rate from channel_id group (older
+            # multi-read fast5 files that lack context_tags/tracking_id
+            # entirely).  channel_id/sampling_rate is a float (e.g. 4000.0).
+            if sample_rate == 0 and chan is not None:
+                raw_rate = chan.attrs.get("sampling_rate", 0)
+                try:
+                    sample_rate = int(float(raw_rate))
+                except (ValueError, TypeError):
+                    pass
 
             if not flowcell and not kit and sample_rate == 0:
                 return None

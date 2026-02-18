@@ -1077,6 +1077,30 @@ def test_extract_chemistry_fast5_experiment_kit(tmp_path: Path) -> None:
     print("  PASS: extract_chemistry_fast5 experiment_kit fallback")
 
 
+def test_extract_chemistry_fast5_channel_id_only(tmp_path: Path) -> None:
+    """Fast5 with no context_tags/tracking_id but channel_id/sampling_rate should still work."""
+    f5 = tmp_path / "20200303_chan_only" / "read.fast5"
+    f5.parent.mkdir(parents=True)
+    import h5py
+    with h5py.File(f5, "w") as f:
+        # Mimic old multi-read layout: read_<uuid>/ with channel_id but no context_tags
+        read_grp = f.create_group("read_00c9fb35-4d96-4dbb-8d5e-3ecec34c156a")
+        read_grp.attrs["pore_type"] = b"not_set"
+        read_grp.attrs["run_id"] = b"ed117474705eeeb612734f6acc0e1f8aa99e3bd7"
+        chan = read_grp.create_group("channel_id")
+        chan.attrs["channel_number"] = b"372"
+        chan.attrs["sampling_rate"] = 4000.0  # float, as in real files
+        raw = read_grp.create_group("Raw")
+        raw.attrs["duration"] = 5000
+        raw.attrs["read_id"] = b"00c9fb35-4d96-4dbb-8d5e-3ecec34c156a"
+    result = extract_chemistry_fast5(f5)
+    assert result is not None, "Should extract sample_rate from channel_id"
+    assert result["sample_rate"] == 4000
+    assert result["flowcell"] == ""
+    assert result["kit"] == ""
+    print("  PASS: extract_chemistry_fast5 channel_id only")
+
+
 def test_tsv_includes_chemistry_columns(tmp_path: Path) -> None:
     """TSV output should include chemistry columns."""
     all_runs = {
@@ -1183,6 +1207,7 @@ def main():
         test_classify_chemistry_sample_rate_fallback,
         test_classify_chemistry_sample_rate_fallback_5khz,
         test_extract_chemistry_fast5_experiment_kit,
+        test_extract_chemistry_fast5_channel_id_only,
         test_analyze_run_includes_chemistry,
         test_pod5_barcoded_chemistry,
         test_fast5_barcoded_sampling,
