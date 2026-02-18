@@ -47,6 +47,8 @@ FLOWCELL_PORE = {
     # R10.4 (intermediate, pre-R10.4.1)
     "FLO-MIN112": "R10.4",
     "FLO-PRO112": "R10.4",
+    # R10.3 (short-lived, early 2020)
+    "FLO-MIN111": "R10.3",
     # R9.4.1
     "FLO-MIN106": "R9.4.1",
     "FLO-MIN106D": "R9.4.1",
@@ -538,6 +540,9 @@ def classify_chemistry(chemistry: dict) -> dict:
         else:
             dorado_version = "0.9.6"
             note = "R10.4 at 4kHz requires dorado 0.9.6"
+    elif pore == "R10.3":
+        dorado_version = "0.9.6"
+        note = "R10.3 support was dropped in dorado 1.0; use dorado 0.9.6"
     elif pore == "RNA004":
         analyte = "rna"
         dorado_version = ">=1.0"

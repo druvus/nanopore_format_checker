@@ -973,6 +973,15 @@ def test_extract_chemistry_fast5_multi_read_tracking_id(tmp_path: Path) -> None:
     print("  PASS: extract_chemistry_fast5 multi-read tracking_id fallback")
 
 
+def test_classify_chemistry_r10_3(tmp_path: Path) -> None:
+    """R10.3 (FLO-MIN111) should recommend dorado 0.9.6."""
+    chem = {"flowcell": "FLO-MIN111", "kit": "", "sample_rate": 4000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "R10.3", f"Expected R10.3, got {result['pore']}"
+    assert result["dorado_version"] == "0.9.6"
+    print("  PASS: classify_chemistry R10.3")
+
+
 def test_classify_chemistry_r10_4(tmp_path: Path) -> None:
     """R10.4 at 5kHz should recommend dorado >=1.0."""
     chem = {"flowcell": "FLO-MIN112", "kit": "SQK-LSK114", "sample_rate": 5000}
@@ -1198,6 +1207,7 @@ def main():
         test_classify_chemistry_rna004,
         test_classify_chemistry_rna002,
         test_classify_chemistry_unknown,
+        test_classify_chemistry_r10_3,
         test_classify_chemistry_r10_4,
         test_classify_chemistry_rna_flowcell,
         test_classify_chemistry_hd_flowcell,
