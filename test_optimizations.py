@@ -1039,6 +1039,44 @@ def test_extract_chemistry_fast5_kit_only(tmp_path: Path) -> None:
     print("  PASS: extract_chemistry_fast5 kit-only fallback")
 
 
+def test_classify_chemistry_sample_rate_fallback(tmp_path: Path) -> None:
+    """When flowcell and kit are both empty, infer pore from sample rate."""
+    chem = {"flowcell": "", "kit": "", "sample_rate": 4000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "R9.4.1", f"Expected R9.4.1 from 4kHz fallback, got {result['pore']}"
+    assert result["dorado_version"] == "0.9.6"
+    print("  PASS: classify_chemistry sample rate fallback (4kHz -> R9.4.1)")
+
+
+def test_classify_chemistry_sample_rate_fallback_5khz(tmp_path: Path) -> None:
+    """5kHz with no flowcell/kit should infer R10.4.1."""
+    chem = {"flowcell": "", "kit": "", "sample_rate": 5000}
+    result = classify_chemistry(chem)
+    assert result["pore"] == "R10.4.1", f"Expected R10.4.1 from 5kHz fallback, got {result['pore']}"
+    assert result["dorado_version"] == ">=1.0"
+    print("  PASS: classify_chemistry sample rate fallback (5kHz -> R10.4.1)")
+
+
+def test_extract_chemistry_fast5_experiment_kit(tmp_path: Path) -> None:
+    """Older MinKNOW used experiment_kit instead of sequencing_kit."""
+    f5 = tmp_path / "20200303_exp_kit" / "read.fast5"
+    f5.parent.mkdir(parents=True)
+    import h5py
+    with h5py.File(f5, "w") as f:
+        ctx = f.create_group("UniqueGlobalKey/context_tags")
+        ctx.attrs["flowcell_type"] = ""
+        ctx.attrs["sequencing_kit"] = ""
+        ctx.attrs["experiment_kit"] = "sqk-lsk109"
+        ctx.attrs["sample_frequency"] = "4000"
+        trk = f.create_group("UniqueGlobalKey/tracking_id")
+        trk.attrs["flow_cell_product_code"] = ""
+    result = extract_chemistry_fast5(f5)
+    assert result is not None, "Should find kit via experiment_kit attribute"
+    assert result["kit"] == "SQK-LSK109"
+    assert result["sample_rate"] == 4000
+    print("  PASS: extract_chemistry_fast5 experiment_kit fallback")
+
+
 def test_tsv_includes_chemistry_columns(tmp_path: Path) -> None:
     """TSV output should include chemistry columns."""
     all_runs = {
@@ -1142,6 +1180,9 @@ def main():
         test_classify_chemistry_kit_fallback,
         test_classify_chemistry_kit_fallback_r10,
         test_extract_chemistry_fast5_kit_only,
+        test_classify_chemistry_sample_rate_fallback,
+        test_classify_chemistry_sample_rate_fallback_5khz,
+        test_extract_chemistry_fast5_experiment_kit,
         test_analyze_run_includes_chemistry,
         test_pod5_barcoded_chemistry,
         test_fast5_barcoded_sampling,

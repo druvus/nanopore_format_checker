@@ -402,6 +402,9 @@ def extract_chemistry_fast5(file_path: Path) -> dict | None:
             if ctx is not None:
                 flowcell = _decode_attr(ctx.attrs.get("flowcell_type", "")).upper()
                 kit = _decode_attr(ctx.attrs.get("sequencing_kit", "")).upper()
+                # Older MinKNOW versions used experiment_kit instead of sequencing_kit
+                if not kit:
+                    kit = _decode_attr(ctx.attrs.get("experiment_kit", "")).upper()
                 rate_str = _decode_attr(ctx.attrs.get("sample_frequency", "0"))
                 sample_rate = int(rate_str) if rate_str.isdigit() else 0
 
@@ -477,6 +480,15 @@ def classify_chemistry(chemistry: dict) -> dict:
     # Fallback: infer pore type from kit when flowcell code is absent
     if pore == "unknown" and kit:
         pore = KIT_PORE.get(kit, "unknown")
+    # Last resort: infer from sample rate when both flowcell and kit are truly
+    # absent (empty strings, not unrecognized codes). 4kHz was exclusively
+    # R9.4.1 on MinION/PromethION before R10.4.1 shipped (late 2022); 5kHz is
+    # exclusively R10.4.1+.
+    if pore == "unknown" and not flowcell and not kit and sample_rate > 0:
+        if sample_rate == 4000:
+            pore = "R9.4.1"
+        elif sample_rate >= 5000:
+            pore = "R10.4.1"
     analyte = "rna" if kit.startswith("SQK-RNA") else "dna"
 
     dorado_version = None
