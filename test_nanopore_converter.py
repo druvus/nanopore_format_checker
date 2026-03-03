@@ -244,3 +244,34 @@ def test_process_item_archive(tmp_path, monkeypatch):
     result = process_item(str(archive), str(tmp_path / "out"), threads=4)
     assert result is True
     assert len(calls) == 1
+
+def test_full_pipeline_dry_run(tmp_path, monkeypatch):
+    """End-to-end test with mocked subprocess calls."""
+    # Create a list file with a directory and an archive
+    run_dir = tmp_path / "run1"
+    run_dir.mkdir()
+    (run_dir / "reads.fast5").write_bytes(b"x" * 500)
+
+    src2 = tmp_path / "run2"
+    src2.mkdir()
+    (src2 / "batch.fast5").write_bytes(b"x" * 2_000_000)
+    archive = tmp_path / "run2.tar.gz"
+    with _tarfile.open(archive, "w:gz") as tar:
+        tar.add(src2, arcname="run2")
+
+    listf = tmp_path / "inputs.txt"
+    listf.write_text(f"{run_dir}\n{archive}\n")
+
+    output = tmp_path / "output"
+
+    # Mock subprocess.run and shutil.which
+    def mock_run(cmd, **kwargs):
+        result = mock.Mock()
+        result.returncode = 0
+        return result
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+
+    from nanopore_converter import main
+    rc = main([str(listf), "--output-dir", str(output)])
+    assert rc == 0
