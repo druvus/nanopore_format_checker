@@ -3,6 +3,7 @@
 
 import subprocess
 import sys
+import unittest.mock as mock
 
 def test_help_flag():
     """Script should print help and exit 0."""
@@ -22,3 +23,108 @@ def test_missing_output_dir():
         capture_output=True, text=True
     )
     assert result.returncode == 2
+
+def test_check_tools_available(tmp_path):
+    """Should succeed when both tools are on PATH."""
+    from nanopore_converter import check_tools
+    # Mock shutil.which to return a path for both tools
+    with mock.patch("nanopore_converter.shutil.which") as mock_which:
+        mock_which.side_effect = lambda cmd: f"/usr/bin/{cmd}"
+        check_tools()  # Should not raise
+
+def test_check_tools_missing():
+    """Should raise SystemExit when tools are missing."""
+    from nanopore_converter import check_tools
+    import pytest
+    with mock.patch("nanopore_converter.shutil.which", return_value=None):
+        with pytest.raises(SystemExit):
+            check_tools()
+
+def test_detect_input_directory(tmp_path):
+    """Directory input should be detected."""
+    from nanopore_converter import detect_input_type
+    d = tmp_path / "run1"
+    d.mkdir()
+    assert detect_input_type(str(d)) == "directory"
+
+def test_detect_input_archive(tmp_path):
+    """Archive files should be detected."""
+    from nanopore_converter import detect_input_type
+    for ext in (".tar.gz", ".tar.bz2", ".zip"):
+        f = tmp_path / f"run1{ext}"
+        f.touch()
+        assert detect_input_type(str(f)) == "archive", f"Failed for {ext}"
+
+def test_detect_input_listfile(tmp_path):
+    """Text files should be detected as list files."""
+    from nanopore_converter import detect_input_type
+    for ext in (".txt", ".csv", ".list"):
+        f = tmp_path / f"inputs{ext}"
+        f.write_text("/some/path\n")
+        assert detect_input_type(str(f)) == "listfile", f"Failed for {ext}"
+
+def test_detect_input_nonexistent():
+    """Non-existent path should return None."""
+    from nanopore_converter import detect_input_type
+    assert detect_input_type("/nonexistent/path") is None
+
+def test_parse_list_file(tmp_path):
+    """Should read paths from a list file, skipping blanks and comments."""
+    from nanopore_converter import parse_list_file
+    listf = tmp_path / "inputs.txt"
+    listf.write_text("/path/to/run1\n\n# comment\n/path/to/run2.tar.gz\n")
+    paths = parse_list_file(str(listf))
+    assert paths == ["/path/to/run1", "/path/to/run2.tar.gz"]
+
+def test_resolve_inputs_directory(tmp_path):
+    """A directory input should resolve to a single-item list."""
+    from nanopore_converter import resolve_inputs
+    d = tmp_path / "run1"
+    d.mkdir()
+    inputs = resolve_inputs(str(d))
+    assert inputs == [str(d)]
+
+def test_resolve_inputs_listfile(tmp_path):
+    """A list file should resolve to multiple paths."""
+    from nanopore_converter import resolve_inputs
+    d1 = tmp_path / "run1"
+    d1.mkdir()
+    d2 = tmp_path / "run2"
+    d2.mkdir()
+    listf = tmp_path / "inputs.txt"
+    listf.write_text(f"{d1}\n{d2}\n")
+    inputs = resolve_inputs(str(listf))
+    assert len(inputs) == 2
+
+def test_classify_fast5_single(tmp_path):
+    """Small fast5 files should be classified as single_read."""
+    from nanopore_converter import classify_fast5_dir
+    d = tmp_path / "fast5"
+    d.mkdir()
+    # Single-read fast5: < 1MB
+    (d / "read1.fast5").write_bytes(b"x" * 500)
+    assert classify_fast5_dir(str(d)) == "single_read_fast5"
+
+def test_classify_fast5_multi(tmp_path):
+    """Large fast5 files should be classified as multi_read."""
+    from nanopore_converter import classify_fast5_dir
+    d = tmp_path / "fast5"
+    d.mkdir()
+    # Multi-read fast5: >= 1MB
+    (d / "batch0.fast5").write_bytes(b"x" * 2_000_000)
+    assert classify_fast5_dir(str(d)) == "multi_read_fast5"
+
+def test_classify_fast5_empty(tmp_path):
+    """Empty directory should return None."""
+    from nanopore_converter import classify_fast5_dir
+    d = tmp_path / "empty"
+    d.mkdir()
+    assert classify_fast5_dir(str(d)) is None
+
+def test_classify_fast5_nested(tmp_path):
+    """Should find fast5 in nested subdirectories."""
+    from nanopore_converter import classify_fast5_dir
+    d = tmp_path / "run" / "fast5_pass" / "barcode01"
+    d.mkdir(parents=True)
+    (d / "read1.fast5").write_bytes(b"x" * 500)
+    assert classify_fast5_dir(str(tmp_path / "run")) == "single_read_fast5"
