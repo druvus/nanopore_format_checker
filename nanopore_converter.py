@@ -93,6 +93,32 @@ def detect_input_type(path_str: str) -> str | None:
     return None
 
 
+def extract_archive(archive_path: str) -> str:
+    """Extract a compressed archive to a temporary directory.
+
+    Returns the path to the temporary directory. Caller is responsible for
+    cleanup.
+    """
+    tmp_dir = tempfile.mkdtemp(prefix="nanopore_conv_")
+    p = Path(archive_path)
+    name = p.name.lower()
+
+    logger.info("Extracting %s to %s", archive_path, tmp_dir)
+
+    if name.endswith((".tar.gz", ".tgz", ".tar.bz2")):
+        mode = "r:gz" if name.endswith((".tar.gz", ".tgz")) else "r:bz2"
+        with tarfile.open(archive_path, mode) as tar:
+            tar.extractall(tmp_dir)
+    elif name.endswith(".zip"):
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            zf.extractall(tmp_dir)
+    else:
+        shutil.rmtree(tmp_dir)
+        raise ValueError(f"Unsupported archive format: {archive_path}")
+
+    return tmp_dir
+
+
 def parse_list_file(path: str) -> list[str]:
     """Read a text file of paths, one per line.
 
@@ -145,6 +171,87 @@ def classify_fast5_dir(dir_path: str) -> str | None:
                 else:
                     return "multi_read_fast5"
     return None
+
+
+def convert_run(input_dir: str, output_base: str, threads: int = 4) -> None:
+    """Convert a single run directory from fast5 to pod5.
+
+    For single_read_fast5: two-step process via intermediate multi_read_fast5.
+    For multi_read_fast5: direct pod5 conversion.
+
+    Raises subprocess.CalledProcessError on conversion failure.
+    """
+    fmt = classify_fast5_dir(input_dir)
+    if fmt is None:
+        logger.warning("No .fast5 files found in %s, skipping.", input_dir)
+        return
+
+    run_name = Path(input_dir).name
+    pod5_out = os.path.join(output_base, run_name, "pod5")
+    os.makedirs(pod5_out, exist_ok=True)
+
+    if fmt == "single_read_fast5":
+        # Step 1: single -> multi
+        multi_tmp = os.path.join(output_base, run_name, "_multi_fast5_tmp")
+        os.makedirs(multi_tmp, exist_ok=True)
+        logger.info("[%s] Step 1/2: single_to_multi_fast5", run_name)
+        result = subprocess.run(
+            [
+                "single_to_multi_fast5",
+                "-i", input_dir,
+                "-s", multi_tmp,
+                "-t", str(threads),
+                "--recursive",
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            logger.error("single_to_multi_fast5 failed:\n%s", result.stderr)
+            raise subprocess.CalledProcessError(
+                result.returncode, "single_to_multi_fast5"
+            )
+
+        # Step 2: multi -> pod5
+        logger.info("[%s] Step 2/2: pod5 convert fast5", run_name)
+        result = subprocess.run(
+            [
+                "pod5", "convert", "fast5",
+                multi_tmp + "/",
+                "--output", pod5_out + "/",
+                "--threads", str(threads),
+                "--recursive",
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            logger.error("pod5 convert failed:\n%s", result.stderr)
+            raise subprocess.CalledProcessError(
+                result.returncode, "pod5 convert fast5"
+            )
+
+        # Cleanup intermediate files
+        logger.info("[%s] Cleaning up intermediate multi_fast5.", run_name)
+        shutil.rmtree(multi_tmp, ignore_errors=True)
+
+    elif fmt == "multi_read_fast5":
+        logger.info("[%s] Converting multi_read_fast5 -> pod5", run_name)
+        result = subprocess.run(
+            [
+                "pod5", "convert", "fast5",
+                input_dir + "/",
+                "--output", pod5_out + "/",
+                "--threads", str(threads),
+                "--recursive",
+            ],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            logger.error("pod5 convert failed:\n%s", result.stderr)
+            raise subprocess.CalledProcessError(
+                result.returncode, "pod5 convert fast5"
+            )
+
+    logger.info("[%s] Conversion complete -> %s", run_name, pod5_out)
 
 
 def main(argv=None):
