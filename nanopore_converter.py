@@ -254,6 +254,59 @@ def convert_run(input_dir: str, output_base: str, threads: int = 4) -> None:
     logger.info("[%s] Conversion complete -> %s", run_name, pod5_out)
 
 
+def get_output_name(input_path: str) -> str:
+    """Derive an output folder name from the input path.
+
+    Strips archive extensions to get a clean directory name.
+    """
+    name = Path(input_path).name
+    # Strip known archive suffixes
+    for ext in (".tar.gz", ".tar.bz2", ".tgz", ".zip"):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+            break
+    return name
+
+
+def process_item(item_path: str, output_dir: str, threads: int = 4) -> bool:
+    """Process a single input item (directory or archive).
+
+    Returns True on success, False on failure.
+    """
+    item_type = detect_input_type(item_path)
+    tmp_dir = None
+
+    try:
+        if item_type == "archive":
+            tmp_dir = extract_archive(item_path)
+            # The extracted archive may contain a single top-level folder
+            # or files directly. Find the directory with fast5 files.
+            work_dir = tmp_dir
+            # If there is exactly one subdirectory, use it
+            entries = list(Path(tmp_dir).iterdir())
+            if len(entries) == 1 and entries[0].is_dir():
+                work_dir = str(entries[0])
+        elif item_type == "directory":
+            work_dir = item_path
+        else:
+            logger.error("Cannot process: %s (not a directory or archive)", item_path)
+            return False
+
+        convert_run(work_dir, output_dir, threads=threads)
+        return True
+
+    except subprocess.CalledProcessError as e:
+        logger.error("Conversion failed for %s: %s", item_path, e)
+        return False
+    except Exception as e:
+        logger.error("Unexpected error processing %s: %s", item_path, e)
+        return False
+    finally:
+        if tmp_dir and os.path.isdir(tmp_dir):
+            logger.info("Cleaning up temp directory: %s", tmp_dir)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def main(argv=None):
     args = parse_args(argv)
 
@@ -264,7 +317,25 @@ def main(argv=None):
 
     check_tools()
 
-    logger.info("Nanopore converter starting.")
+    inputs = resolve_inputs(args.input)
+    if not inputs:
+        logger.error("No valid inputs found.")
+        sys.exit(2)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    succeeded = 0
+    failed = 0
+    for item in inputs:
+        logger.info("Processing: %s", item)
+        if process_item(item, args.output_dir, threads=args.threads):
+            succeeded += 1
+        else:
+            failed += 1
+
+    logger.info("Done. %d succeeded, %d failed.", succeeded, failed)
+    if failed > 0:
+        return 1
     return 0
 
 

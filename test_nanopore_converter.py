@@ -210,3 +210,37 @@ def test_convert_run_single_read(tmp_path, monkeypatch):
     assert len(calls) == 2
     assert "single_to_multi_fast5" in calls[0][0]
     assert "pod5" in calls[1][0]
+
+def test_process_item_directory(tmp_path, monkeypatch):
+    """process_item should call convert_run for a directory."""
+    from nanopore_converter import process_item
+    calls = []
+    monkeypatch.setattr(
+        "nanopore_converter.convert_run",
+        lambda *a, **kw: calls.append(("convert_run", a, kw))
+    )
+    d = tmp_path / "run1"
+    d.mkdir()
+    (d / "test.fast5").write_bytes(b"x" * 500)
+    result = process_item(str(d), str(tmp_path / "out"), threads=4)
+    assert result is True
+    assert len(calls) == 1
+
+def test_process_item_archive(tmp_path, monkeypatch):
+    """process_item should extract archive, convert, then cleanup."""
+    from nanopore_converter import process_item
+    calls = []
+    monkeypatch.setattr(
+        "nanopore_converter.convert_run",
+        lambda *a, **kw: calls.append(("convert_run", a, kw))
+    )
+    # Create a tar.gz with a fake fast5
+    src = tmp_path / "data"
+    src.mkdir()
+    (src / "test.fast5").write_bytes(b"x" * 500)
+    archive = tmp_path / "data.tar.gz"
+    with _tarfile.open(archive, "w:gz") as tar:
+        tar.add(src / "test.fast5", arcname="data/test.fast5")
+    result = process_item(str(archive), str(tmp_path / "out"), threads=4)
+    assert result is True
+    assert len(calls) == 1
