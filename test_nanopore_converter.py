@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Tests for nanopore_converter.py"""
 
+import shutil
 import subprocess
 import sys
+import tarfile as _tarfile
 import unittest.mock as mock
+import zipfile as _zipfile
+from pathlib import Path
 
 def test_help_flag():
     """Script should print help and exit 0."""
@@ -39,6 +43,35 @@ def test_check_tools_missing():
     with mock.patch("nanopore_converter.shutil.which", return_value=None):
         with pytest.raises(SystemExit):
             check_tools()
+
+def test_extract_tar_gz(tmp_path):
+    """Should extract .tar.gz to temp dir and return the path."""
+    from nanopore_converter import extract_archive
+    # Create a tar.gz with a file inside
+    src = tmp_path / "data"
+    src.mkdir()
+    (src / "test.fast5").write_bytes(b"fake")
+    archive = tmp_path / "data.tar.gz"
+    with _tarfile.open(archive, "w:gz") as tar:
+        tar.add(src / "test.fast5", arcname="data/test.fast5")
+    result = extract_archive(str(archive))
+    assert Path(result).is_dir()
+    # Find the fast5 inside
+    fast5_files = list(Path(result).rglob("*.fast5"))
+    assert len(fast5_files) == 1
+    shutil.rmtree(result)
+
+def test_extract_zip(tmp_path):
+    """Should extract .zip to temp dir and return the path."""
+    from nanopore_converter import extract_archive
+    archive = tmp_path / "data.zip"
+    with _zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("data/test.fast5", b"fake")
+    result = extract_archive(str(archive))
+    assert Path(result).is_dir()
+    fast5_files = list(Path(result).rglob("*.fast5"))
+    assert len(fast5_files) == 1
+    shutil.rmtree(result)
 
 def test_detect_input_directory(tmp_path):
     """Directory input should be detected."""
@@ -128,3 +161,52 @@ def test_classify_fast5_nested(tmp_path):
     d.mkdir(parents=True)
     (d / "read1.fast5").write_bytes(b"x" * 500)
     assert classify_fast5_dir(str(tmp_path / "run")) == "single_read_fast5"
+
+def test_convert_run_multi_read(tmp_path, monkeypatch):
+    """Multi-read fast5 should call pod5 convert directly."""
+    from nanopore_converter import convert_run
+    calls = []
+    def mock_run(cmd, **kwargs):
+        calls.append(cmd)
+        result = mock.Mock()
+        result.returncode = 0
+        return result
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    input_dir = tmp_path / "run1"
+    input_dir.mkdir()
+    (input_dir / "batch.fast5").write_bytes(b"x" * 2_000_000)
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    convert_run(str(input_dir), str(output_dir), threads=4)
+
+    # Should have called pod5 convert fast5 once
+    assert len(calls) == 1
+    assert "pod5" in calls[0][0]
+
+def test_convert_run_single_read(tmp_path, monkeypatch):
+    """Single-read fast5 should call single_to_multi_fast5 then pod5 convert."""
+    from nanopore_converter import convert_run
+    calls = []
+    def mock_run(cmd, **kwargs):
+        calls.append(cmd)
+        result = mock.Mock()
+        result.returncode = 0
+        return result
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    input_dir = tmp_path / "run1"
+    input_dir.mkdir()
+    (input_dir / "read.fast5").write_bytes(b"x" * 500)
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+
+    convert_run(str(input_dir), str(output_dir), threads=4)
+
+    # Should have called single_to_multi_fast5, then pod5 convert
+    assert len(calls) == 2
+    assert "single_to_multi_fast5" in calls[0][0]
+    assert "pod5" in calls[1][0]
