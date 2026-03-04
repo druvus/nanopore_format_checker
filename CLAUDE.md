@@ -4,9 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Single-file Python CLI tool (`nanopore_format_checker.py`) that scans a folder of Oxford Nanopore sequencing run directories and classifies each run by its read format: `pod5`, `multi_read_fast5`, or `single_read_fast5`. It also detects `fastq` output directories and compressed archives. Detects flowcell chemistry (R9.4.1, R10.3, R10.4, R10.4.1, RNA004) from data file metadata and recommends the appropriate dorado version for basecalling. Optionally generates bash conversion scripts with post-conversion metadata patching.
+Two standalone Python CLI tools for Oxford Nanopore sequencing data:
+
+- **`nanopore_format_checker.py`** -- Scans a folder of nanopore run directories and classifies each run by its read format (`pod5`, `multi_read_fast5`, `single_read_fast5`). Detects `fastq` output directories and compressed archives. Extracts flowcell chemistry (R9.4.1, R10.3, R10.4, R10.4.1, RNA004) from data file metadata and recommends the appropriate dorado version for basecalling. Optionally generates bash conversion scripts with post-conversion metadata patching.
+
+- **`nanopore_converter.py`** -- Converts fast5 files to pod5 format. Accepts a folder, compressed archive (`.tar.gz`, `.tar.bz2`, `.zip`), or a text file listing paths (one per line, mixed folders and archives). Handles the two-step single_read_fast5 conversion automatically (`single_to_multi_fast5` then `pod5 convert fast5`). Calls conversion tools as subprocesses.
 
 ## Running
+
+### Format checker
 
 ```bash
 python nanopore_format_checker.py /path/to/runs_folder
@@ -17,13 +23,22 @@ python nanopore_format_checker.py /path/to/runs_folder --convert-to pod5 --outpu
 python nanopore_format_checker.py /path/to/runs_folder -o stats.tsv
 ```
 
+### Converter
+
+```bash
+python nanopore_converter.py /path/to/run_folder --output-dir /scratch/converted
+python nanopore_converter.py /path/to/archive.tar.gz --output-dir /scratch/converted
+python nanopore_converter.py input_list.txt --output-dir /scratch/converted --threads 8 --verbose
+```
+
 ### Tests
 
 ```bash
-python test_optimizations.py
+python test_optimizations.py          # format checker tests (75 tests)
+python -m pytest test_nanopore_converter.py -v  # converter tests (22 tests)
 ```
 
-### CLI flags
+### Format checker CLI flags
 
 | Flag | Short | Description |
 |------|-------|-------------|
@@ -34,17 +49,28 @@ python test_optimizations.py
 | `--output-dir DIR` | | Base output directory for converted files (default: alongside originals) |
 | `--output-stats FILE` | `-o` | Write per-run statistics to a TSV file |
 
+### Converter CLI flags
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `input` | | Positional: folder, compressed archive, or text file listing paths |
+| `--output-dir DIR` | | Required. Base output directory for converted pod5 files |
+| `--threads N` | | Thread count for conversion tools (default: 4) |
+| `--verbose` | `-v` | Enable detailed logging |
+
 ## Dependencies
 
 ```bash
 pip install h5py ont_fast5_api pod5
 ```
 
-`h5py` is the only hard dependency (for fast5 inspection). `pod5` is optional (needed for pod5 chemistry extraction and metadata patching).
+`h5py` is the only hard dependency for the format checker (fast5 inspection). `pod5` is optional for the checker (needed for pod5 chemistry extraction and metadata patching). The converter requires `ont_fast5_api` (provides `single_to_multi_fast5` CLI) and `pod5` (provides `pod5 convert fast5` CLI) to be installed and on PATH.
 
 ## Architecture
 
-The tool is a single script with no module structure. Key functions:
+### Format checker (`nanopore_format_checker.py`)
+
+Single script with no module structure. Key functions:
 
 - `is_nanopore_run_dir()` - Identifies run directories by the `YYYYMMDD_` naming convention
 - `discover_run_structure()` - Single-pass directory walk that categorizes all format-related subdirectories (pod5, fast5, fastq variants)
@@ -73,6 +99,37 @@ Pore type inference: `FLOWCELL_PORE` table (23 entries) -> `KIT_PORE` table (35 
 ### Detection strategy
 
 The tool searches for format-specific subdirectories (`pod5/`, `pod5_pass/`, `fast5/`, `fast5_pass/`, `fastq_pass/`, etc.) up to 5 levels deep via `discover_run_structure()`. For fast5, it samples one file and classifies by size rather than opening the HDF5 structure. Barcoded layouts (e.g., `fast5_pass/barcode13/`) are handled by descending into subdirectories during sampling.
+
+### Converter (`nanopore_converter.py`)
+
+Single script that orchestrates format conversion via subprocess calls. Key functions:
+
+- `parse_args()` - CLI argument parsing (input, --output-dir, --threads, --verbose)
+- `check_tools()` - Verifies `single_to_multi_fast5` and `pod5` are on PATH; exits with code 2 if missing
+- `detect_input_type()` - Auto-detects whether input is a directory, archive (`.tar.gz`, `.tar.bz2`, `.zip`), or list file (`.txt`, `.csv`, `.list`)
+- `extract_archive()` - Extracts compressed archives to a temp directory; caller handles cleanup
+- `parse_list_file()` - Reads a text file of paths (one per line, skips blanks and `#` comments)
+- `resolve_inputs()` - Resolves the input argument to a flat list of paths to process
+- `classify_fast5_dir()` - Walks a directory, samples one `.fast5` file, classifies by the 1 MB size threshold (same heuristic as the format checker)
+- `convert_run()` - Core conversion: for single_read_fast5, runs `single_to_multi_fast5` then `pod5 convert fast5`; for multi_read_fast5, runs `pod5 convert fast5` directly. Cleans up intermediate multi_fast5 temp files
+- `get_output_name()` - Derives output folder name from input path, stripping archive extensions
+- `process_item()` - Orchestrates one input item (directory or archive) with try/except/finally cleanup of temp directories
+- `main()` - Entry point: parses args, checks tools, resolves inputs, iterates over items, tracks success/failure counts
+
+### Conversion pipeline
+
+```
+single_read_fast5 -> single_to_multi_fast5 -> pod5 convert fast5 -> cleanup temp
+multi_read_fast5  -> pod5 convert fast5
+```
+
+Output structure: `<output-dir>/<input_basename>/pod5/*.pod5`
+
+### Exit codes (converter)
+
+- 0: all conversions succeeded
+- 1: some conversions failed (summary printed)
+- 2: fatal error (bad arguments, missing tools)
 
 ## Conventions
 

@@ -1,6 +1,6 @@
-# Nanopore Run Format Checker
+# Nanopore Format Checker & Converter
 
-Scans a folder of Oxford Nanopore sequencing run directories and classifies each run by its read format. Detects flowcell chemistry and recommends the appropriate dorado basecaller version. Optionally generates conversion scripts with metadata patching.
+Tools for inspecting and converting Oxford Nanopore sequencing data.
 
 ## Features
 
@@ -8,6 +8,8 @@ Scans a folder of Oxford Nanopore sequencing run directories and classifies each
 - **Chemistry detection**: Identifies pore type (R9.4.1, R10.3, R10.4, R10.4.1, RNA004) from flowcell codes, kit codes, or sample rate
 - **Dorado version guidance**: Recommends dorado 0.9.6 for R9.4.1/R10.3 data, dorado >=1.0 for R10.4.1
 - **Conversion scripts**: Generates bash scripts for fast5-to-pod5 conversion with correct metadata
+- **Direct conversion**: Converts fast5 to pod5 directly, handling single-read and multi-read formats automatically
+- **Flexible input**: Accepts folders, compressed archives, or text files listing multiple inputs
 - **TSV export**: Per-run statistics including format, file counts, data sizes, and chemistry
 
 ## Installation
@@ -16,9 +18,11 @@ Scans a folder of Oxford Nanopore sequencing run directories and classifies each
 pip install h5py ont_fast5_api pod5
 ```
 
-`h5py` is the only hard dependency. `pod5` is optional (enables pod5 chemistry extraction and metadata patching in conversion scripts).
+`h5py` is the only hard dependency for the format checker. The converter requires `ont_fast5_api` (provides `single_to_multi_fast5`) and `pod5` (provides `pod5 convert fast5`) to be installed and on PATH.
 
 ## Usage
+
+### Format checker
 
 ```bash
 # Scan and classify all runs
@@ -40,7 +44,7 @@ python nanopore_format_checker.py /path/to/runs_folder --convert-to pod5 --outpu
 python nanopore_format_checker.py /path/to/runs_folder -o stats.tsv
 ```
 
-### Options
+#### Checker options
 
 | Flag | Short | Description |
 |------|-------|-------------|
@@ -51,7 +55,7 @@ python nanopore_format_checker.py /path/to/runs_folder -o stats.tsv
 | `--output-dir DIR` | | Base output directory for converted files |
 | `--output-stats FILE` | `-o` | Write per-run statistics to a TSV file |
 
-### Example output
+#### Example output
 
 ```
 Found 12 nanopore run(s) and 0 archive(s) in '/data/sequencing'
@@ -63,6 +67,48 @@ Run / Archive                                           Format(s)               
 20200210_MN19414_old_run                                single_read_fast5         R9.4.1 4kHz        ~12.5 GB     156203
 20180501_MN17089_very_old                               multi_read_fast5          R9.4.1 4kHz        8.2 GB       24
 ```
+
+### Converter
+
+```bash
+# Convert a single run folder
+python nanopore_converter.py /path/to/run_folder --output-dir /scratch/converted
+
+# Convert from a compressed archive
+python nanopore_converter.py /path/to/run.tar.gz --output-dir /scratch/converted
+
+# Convert multiple runs from a list file
+python nanopore_converter.py input_list.txt --output-dir /scratch/converted
+
+# With more threads and verbose output
+python nanopore_converter.py /path/to/input --output-dir /scratch/converted --threads 8 --verbose
+```
+
+The converter auto-detects the input type and fast5 format:
+- **single_read_fast5** (files < 1 MB): runs `single_to_multi_fast5` then `pod5 convert fast5`, cleans up intermediate files
+- **multi_read_fast5** (files >= 1 MB): runs `pod5 convert fast5` directly
+- **Compressed archives**: extracted to a temp directory, converted, then cleaned up
+
+Output is written to `<output-dir>/<input_name>/pod5/`.
+
+The input list file supports one path per line (folders and archives can be mixed), with blank lines and `#` comments skipped.
+
+#### Converter options
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `input` | | Positional: folder, compressed archive, or text file listing paths |
+| `--output-dir DIR` | | Required. Base output directory for converted pod5 files |
+| `--threads N` | | Thread count for conversion tools (default: 4) |
+| `--verbose` | `-v` | Enable detailed logging |
+
+#### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | All conversions succeeded |
+| 1 | Some conversions failed (summary printed) |
+| 2 | Fatal error (bad arguments, missing tools) |
 
 ## Format detection
 
@@ -104,7 +150,11 @@ Generated scripts handle:
 ## Tests
 
 ```bash
+# Format checker tests (75 tests)
 python test_optimizations.py
+
+# Converter tests (22 tests)
+python -m pytest test_nanopore_converter.py -v
 ```
 
-75 tests covering format detection, chemistry extraction, conversion script generation, and metadata patching.
+The format checker tests cover format detection, chemistry extraction, conversion script generation, and metadata patching. The converter tests cover input detection, archive extraction, fast5 classification, conversion logic, and end-to-end pipeline integration.
