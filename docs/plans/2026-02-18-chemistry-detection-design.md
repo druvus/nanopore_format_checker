@@ -1,5 +1,7 @@
 # Chemistry Detection Design
 
+> **Superseded (2026-11):** the dorado recommendations in this historical plan are out of date (dorado never supported R10.3 or R10.4). See "Dorado version recommendations" in the README.
+
 Detect flowcell chemistry (R9.4.1, R10.4.1, RNA) from pod5/fast5 file
 metadata and recommend the appropriate dorado version and model for
 basecalling.

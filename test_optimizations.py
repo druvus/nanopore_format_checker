@@ -586,7 +586,7 @@ def test_write_stats_tsv_basic(tmp_path: Path) -> None:
     assert header == ["run_name", "format", "file_count", "data_size_bytes",
                       "size_estimated", "directories", "notes",
                       "flowcell_code", "sequencing_kit", "sample_rate",
-                      "pore_type", "dorado_version"]
+                      "pore_type", "dorado_version", "dorado_model", "dorado_note"]
     row = lines[1].strip().split("\t")
     assert row[0] == "20240101_run_pod5"
     assert row[1] == "pod5"
@@ -1079,21 +1079,59 @@ def test_extract_chemistry_pod5_context_tags_fallback(tmp_path: Path) -> None:
 
 
 def test_classify_chemistry_r10_3(tmp_path: Path) -> None:
-    """R10.3 (FLO-MIN111) should recommend dorado 0.9.6."""
+    """R10.3 (FLO-MIN111): no dorado release has a model -> Guppy only."""
     chem = {"flowcell": "FLO-MIN111", "kit": "", "sample_rate": 4000}
     result = classify_chemistry(chem)
     assert result["pore"] == "R10.3", f"Expected R10.3, got {result['pore']}"
-    assert result["dorado_version"] == "0.9.6"
+    assert result["dorado_version"] is None
+    assert "Guppy" in result["note"]
     print("  PASS: classify_chemistry R10.3")
 
 
 def test_classify_chemistry_r10_4(tmp_path: Path) -> None:
-    """R10.4 at 5kHz should recommend dorado >=1.0."""
-    chem = {"flowcell": "FLO-MIN112", "kit": "SQK-LSK114", "sample_rate": 5000}
-    result = classify_chemistry(chem)
-    assert result["pore"] == "R10.4"
-    assert result["dorado_version"] == ">=1.0"
-    print("  PASS: classify_chemistry R10.4 5kHz")
+    """R10.4 (FLO-MIN112): no dorado release has a model, at any sample rate."""
+    for rate in (4000, 5000):
+        chem = {"flowcell": "FLO-MIN112", "kit": "SQK-LSK112", "sample_rate": rate}
+        result = classify_chemistry(chem)
+        assert result["pore"] == "R10.4"
+        assert result["dorado_version"] is None
+        assert "Guppy" in result["note"]
+    # Kit 12 alone (no flowcell code) also maps to R10.4
+    result = classify_chemistry({"flowcell": "", "kit": "SQK-NBD112-24", "sample_rate": 4000})
+    assert result["pore"] == "R10.4" and result["dorado_version"] is None
+    print("  PASS: classify_chemistry R10.4")
+
+
+def test_classify_chemistry_dorado_matrix(tmp_path: Path) -> None:
+    """Recommendations follow dorado's real support matrix (1.0 changelog,
+    0.9.6 kits.cpp chemistry table)."""
+    cases = [
+        # (flowcell, kit, rate) -> (pore, version, explicit model or None)
+        (("FLO-MIN114", "SQK-LSK114", 5000), ("R10.4.1", ">=1.0", None)),
+        (("FLO-MIN114", "SQK-LSK114", 4000),
+         ("R10.4.1", "0.9.6", "dna_r10.4.1_e8.2_400bps_sup@v4.1.0")),
+        (("FLO-MIN114", "SQK-LSK114-260", 4000),
+         ("R10.4.1", "0.9.6", "dna_r10.4.1_e8.2_260bps_sup@v4.1.0")),
+        (("FLO-MIN106", "SQK-LSK109", 4000), ("R9.4.1", "0.9.6", "dna_r9.4.1_e8_sup@v3.6")),
+        (("FLO-MIN106", "SQK-RNA002", 3000), ("R9.4.1", "0.9.6", "rna002_70bps_hac@v3")),
+        (("FLO-MIN107", "SQK-LSK108", 4000), ("R9.5.1", None, None)),
+        (("FLO-MIN004RA", "SQK-RNA004", 4000), ("RNA004", ">=1.0", None)),
+        (("", "SQK-LSK110", 4000), ("R9.4.1", "0.9.6", "dna_r9.4.1_e8_sup@v3.6")),
+    ]
+    for (fc, kit, rate), (pore, ver, model) in cases:
+        r = classify_chemistry({"flowcell": fc, "kit": kit, "sample_rate": rate})
+        assert (r["pore"], r["dorado_version"], r["explicit_model"]) == (pore, ver, model), \
+            f"{fc}/{kit}/{rate}: {r}"
+    # RNA002 has no sup model
+    assert classify_chemistry({"flowcell": "FLO-MIN106", "kit": "SQK-RNA002",
+                               "sample_rate": 3000})["model_hint"] == "hac"
+    # Unknown sample rate on R10.4.1 is not reported as 4 kHz
+    r = classify_chemistry({"flowcell": "FLO-MIN114", "kit": "SQK-LSK114", "sample_rate": 0})
+    assert r["dorado_version"] == ">=1.0" and "unknown" in r["note"].lower()
+    # Off-spec R9.4.1 sample rate is flagged
+    r = classify_chemistry({"flowcell": "FLO-PRO002", "kit": "SQK-LSK109", "sample_rate": 6000})
+    assert r["dorado_version"] == "0.9.6" and "6000 Hz" in r["note"]
+    print("  PASS: classify_chemistry dorado support matrix")
 
 
 def test_classify_chemistry_rna_flowcell(tmp_path: Path) -> None:
@@ -1479,6 +1517,7 @@ def main():
         test_is_raw_archive,
         test_conversion_script_quoting_and_archives,
         test_metadata_patch_executes,
+        test_classify_chemistry_dorado_matrix,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:

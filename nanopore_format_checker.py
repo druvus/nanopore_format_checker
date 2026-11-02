@@ -52,7 +52,6 @@ FLOWCELL_PORE = {
     # R9.4.1
     "FLO-MIN106": "R9.4.1",
     "FLO-MIN106D": "R9.4.1",
-    "FLO-MIN107": "R9.4.1",
     "FLO-FLG001": "R9.4.1",
     "FLO-PRO002": "R9.4.1",
     "FLO-PRO002M": "R9.4.1",
@@ -60,6 +59,8 @@ FLOWCELL_PORE = {
     "FLO-MINSP6": "R9.4.1",
     "FLO-PRO001": "R9.4.1",
     "FLO-PRO002-ECO": "R9.4.1",
+    # R9.5.1 (1D^2 flowcell; dorado only supports it for RNA002, not DNA)
+    "FLO-MIN107": "R9.5.1",
     # RNA (direct RNA flowcells)
     "FLO-MIN004RA": "RNA004",
     "FLO-PRO004RA": "RNA004",
@@ -81,10 +82,22 @@ KIT_PORE = {
     "SQK-DCS109": "R9.4.1",
     "SQK-CAS109": "R9.4.1",
     "SQK-CS9109": "R9.4.1",
-    "SQK-NBD112-24": "R9.4.1",
-    "SQK-NBD112-96": "R9.4.1",
+    # Kit 10/11 (R9.4.1 e8 in dorado's chemistry table)
+    "SQK-LSK110": "R9.4.1",
+    "SQK-LSK110-XL": "R9.4.1",
+    "SQK-LSK111": "R9.4.1",
+    "SQK-LSK111-XL": "R9.4.1",
+    "SQK-NBD111-24": "R9.4.1",
+    "SQK-NBD111-96": "R9.4.1",
+    "SQK-RBK110-96": "R9.4.1",
+    "SQK-RBK111-24": "R9.4.1",
+    "SQK-RBK111-96": "R9.4.1",
+    "SQK-PCB110": "R9.4.1",
+    "SQK-PCB111-24": "R9.4.1",
+    "SQK-PCS111": "R9.4.1",
+    "SQK-MLK111-96-XL": "R9.4.1",
+    "SQK-ULK001": "R9.4.1",
     "SQK-16S024": "R9.4.1",
-    "SQK-16S114-24": "R10.4.1",
     # Older R9.4.1 kits
     "SQK-RAD002": "R9.4.1",
     "SQK-RAD003": "R9.4.1",
@@ -94,7 +107,12 @@ KIT_PORE = {
     "SQK-RAS201": "R9.4.1",
     "SQK-RLB001": "R9.4.1",
     "VSK-VSK002": "R9.4.1",
-    # R10.4.1 kits
+    # Kit 12 (Q20+ chemistry for R10.4 / FLO-MIN112; dorado has no model)
+    "SQK-LSK112": "R10.4",
+    "SQK-LSK112-XL": "R10.4",
+    "SQK-NBD112-24": "R10.4",
+    "SQK-NBD112-96": "R10.4",
+    # R10.4.1 kits (Kit 14)
     "SQK-LSK114": "R10.4.1",
     "SQK-LSK114-XL": "R10.4.1",
     "SQK-RAD114": "R10.4.1",
@@ -105,6 +123,11 @@ KIT_PORE = {
     "SQK-PCS114": "R10.4.1",
     "SQK-PCB114-24": "R10.4.1",
     "SQK-ULK114": "R10.4.1",
+    "SQK-RPB114-24": "R10.4.1",
+    "SQK-MLK114-96-XL": "R10.4.1",
+    "SQK-16S114-24": "R10.4.1",
+    "SQK-MAB114-24": "R10.4.1",
+    "SQK-APK114": "R10.4.1",
     # RNA kits
     "SQK-RNA002": "RNA002",
     "SQK-RNA004": "RNA004",
@@ -575,11 +598,37 @@ def extract_chemistry(file_path: Path, file_format: str) -> dict | None:
     return None
 
 
+# Explicit dorado model names, for runs where automatic model selection
+# ("dorado basecaller sup ...") cannot work (fast5 input, or flowcell/kit/
+# sample-rate combinations missing from dorado's chemistry table).
+# Source: dorado 0.9.6 model list (last release with R9.4.1/4 kHz/RNA002).
+DORADO_LEGACY_MODELS = {
+    "R9.4.1": "dna_r9.4.1_e8_sup@v3.6",
+    "R10.4.1_4khz": "dna_r10.4.1_e8.2_400bps_sup@v4.1.0",
+    "R10.4.1_260bps": "dna_r10.4.1_e8.2_260bps_sup@v4.1.0",
+    "RNA002": "rna002_70bps_hac@v3",  # no sup model exists for RNA002
+}
+
+
 def classify_chemistry(chemistry: dict) -> dict:
     """Map raw chemistry metadata to pore type and dorado version recommendation.
 
     Input: {"flowcell": "FLO-MIN114", "kit": "SQK-LSK114", "sample_rate": 5000}
-    Output: {"pore", "analyte", "dorado_version", "model_hint", "note"}
+    Output: {"pore", "analyte", "dorado_version", "model_hint",
+             "explicit_model", "note"}
+
+    Support matrix (verified against the dorado changelog and the chemistry
+    table in dorado 0.9.6's dorado/models/kits.cpp):
+      - dorado >=1.0: DNA R10.4.1 E8.2 at 5 kHz and RNA004 only; POD5 input
+        only (FAST5 support was removed in 1.0.0).
+      - dorado 0.9.6 (last 0.x): additionally R9.4.1 E8 (4 kHz), R10.4.1 at
+        4 kHz (400bps and 260bps), and RNA002.  Reads FAST5, but automatic
+        model selection needs POD5 with a recognised flowcell/kit pair.
+      - No dorado release has models for R10.3 (FLO-MIN111), R10.4
+        (FLO-MIN112/PRO112, Kit 12) or DNA on R9.5.1 (FLO-MIN107); those
+        need the discontinued Guppy basecaller.
+
+    dorado_version is None when no dorado release can basecall the data.
     """
     flowcell = chemistry.get("flowcell", "")
     kit = chemistry.get("kit", "")
@@ -603,45 +652,86 @@ def classify_chemistry(chemistry: dict) -> dict:
 
     dorado_version = None
     model_hint = "sup"
+    explicit_model = None
     note = None
+    legacy_input = ("dorado 0.9.6 reads fast5, but automatic model selection "
+                    "needs pod5 input")
 
-    # RNA kit overrides
-    if kit == "SQK-RNA004":
-        dorado_version = ">=1.0"
-        note = None
-    elif kit == "SQK-RNA002":
-        dorado_version = "0.9.6"
-        note = "RNA002 support was dropped in dorado 1.0; use dorado 0.9.6"
-    elif pore == "R9.4.1":
-        dorado_version = "0.9.6"
-        note = "R9.4.1 support was dropped in dorado 1.0; use dorado 0.9.6"
-    elif pore == "R10.4.1":
-        if sample_rate >= 5000:
-            dorado_version = ">=1.0"
-        else:
-            dorado_version = "0.9.6"
-            note = "R10.4.1 at 4kHz requires dorado 0.9.6; 5kHz data supported in >=1.0"
-    elif pore == "R10.4":
-        if sample_rate >= 5000:
-            dorado_version = ">=1.0"
-        else:
-            dorado_version = "0.9.6"
-            note = "R10.4 at 4kHz requires dorado 0.9.6"
-    elif pore == "R10.3":
-        dorado_version = "0.9.6"
-        note = "R10.3 support was dropped in dorado 1.0; use dorado 0.9.6"
-    elif pore == "RNA004":
+    if kit.startswith("SQK-RNA004") or pore == "RNA004":
         analyte = "rna"
         dorado_version = ">=1.0"
+    elif kit.startswith("SQK-RNA002"):
+        analyte = "rna"
+        dorado_version = "0.9.6"
+        model_hint = "hac"
+        explicit_model = DORADO_LEGACY_MODELS["RNA002"]
+        note = ("RNA002 support was dropped in dorado 1.0; use dorado 0.9.6 "
+                "(no sup model exists for RNA002)")
+    elif pore == "R9.4.1":
+        dorado_version = "0.9.6"
+        explicit_model = DORADO_LEGACY_MODELS["R9.4.1"]
+        note = "R9.4.1 support was dropped in dorado 1.0; use dorado 0.9.6"
+        if sample_rate and sample_rate != 4000:
+            note += (f"; dorado's only R9.4.1 model expects 4 kHz but this run "
+                     f"was sampled at {sample_rate} Hz -- check results carefully")
+    elif pore == "R10.4.1":
+        is_260bps = kit.endswith("-260")
+        if sample_rate == 5000 and not is_260bps:
+            dorado_version = ">=1.0"
+        elif sample_rate == 4000 or is_260bps:
+            dorado_version = "0.9.6"
+            explicit_model = DORADO_LEGACY_MODELS[
+                "R10.4.1_260bps" if is_260bps else "R10.4.1_4khz"]
+            note = ("R10.4.1 at 4 kHz requires dorado 0.9.6; only 5 kHz data "
+                    "is supported in >=1.0")
+        else:
+            dorado_version = ">=1.0"
+            note = ("Sample rate unknown: dorado >=1.0 supports R10.4.1 at "
+                    "5 kHz only; use dorado 0.9.6 if the run was sampled at 4 kHz")
+    elif pore in ("R10.4", "R10.3", "R9.5.1"):
+        names = {"R10.4": "R10.4 (FLO-MIN112/FLO-PRO112, Kit 12)",
+                 "R10.3": "R10.3 (FLO-MIN111)",
+                 "R9.5.1": "DNA on R9.5.1 (FLO-MIN107)"}
+        note = (f"No dorado release supports {names[pore]}; basecall with the "
+                f"legacy Guppy basecaller (discontinued)")
     # pore == "unknown" -> dorado_version stays None
+
+    if dorado_version == "0.9.6" and note:
+        note += f". {legacy_input}"
 
     return {
         "pore": pore,
         "analyte": analyte,
         "dorado_version": dorado_version,
-        "model_hint": model_hint,
+        "model_hint": model_hint if dorado_version else None,
+        "explicit_model": explicit_model,
         "note": note,
     }
+
+
+def dorado_advice_lines(chem_class: dict, formats: list[str]) -> list[str]:
+    """Human-readable dorado recommendation for one run (verbose output)."""
+    lines = []
+    ver = chem_class.get("dorado_version")
+    note = chem_class.get("note")
+    if not ver:
+        if note:
+            lines.append(f"dorado: {note}")
+        return lines
+    has_fast5 = any(f in formats for f in
+                    ("single_read_fast5", "multi_read_fast5", "fast5_unknown"))
+    has_pod5 = "pod5" in formats
+    lines.append(f"dorado: use version {ver}")
+    if note:
+        lines.append(f"        {note}")
+    if ver == ">=1.0" and has_fast5 and not has_pod5:
+        lines.append("        dorado >=1.0 cannot read fast5: convert to pod5 first "
+                     "(--convert-to pod5 or nanopore_converter.py)")
+    lines.append(f"model: dorado basecaller {chem_class['model_hint']} <pod5_dir>/ > calls.bam")
+    if chem_class.get("explicit_model"):
+        lines.append(f"       or, if auto-selection fails or input is fast5: "
+                     f"dorado basecaller {chem_class['explicit_model']} <input>/ > calls.bam")
+    return lines
 
 
 def count_files_recursive(directory: Path, ext: str) -> tuple[int, int]:
@@ -1151,7 +1241,7 @@ def print_conversion_help(fmt: str):
         print("  Conversion options:")
         print("    -> To pod5:         pod5 convert fast5 ./run_dir/ --output ./pod5_dir/ --threads 20 --recursive")
         print("                        # https://github.com/nanoporetech/pod5-file-format")
-        print("    -> To single_fast5: multi_to_single_fast5 --input_path multi/ --save_path single/")
+        print("    -> To single_fast5: multi_to_single_fast5 --input_path multi/ --save_path single/ --recursive")
         print("                        # https://github.com/nanoporetech/ont_fast5_api")
     elif fmt == "single_read_fast5":
         print("  Conversion options:")
@@ -1164,7 +1254,7 @@ def print_conversion_help(fmt: str):
         print("  Conversion options:")
         print("    -> To fast5:        pod5 convert to_fast5 input.pod5 --output ./fast5_dir/")
         print("    -> Inspect:         pod5 inspect reads input.pod5")
-        print("    -> Merge:           pod5 merge output.pod5 input1.pod5 input2.pod5")
+        print("    -> Merge:           pod5 merge input1.pod5 input2.pod5 --output merged.pod5")
 
 
 def _pod5_metadata_fix_lines(pod5_dir: str, chemistry: dict) -> list[str]:
@@ -1340,12 +1430,14 @@ def write_stats_tsv(all_runs: dict, output_path: str) -> None:
     fastq output generates two rows.
 
     Columns: run_name, format, file_count, data_size_bytes, size_estimated,
-    directories, notes
+    directories, notes, flowcell_code, sequencing_kit, sample_rate, pore_type,
+    dorado_version, dorado_model (explicit legacy model name, if any),
+    dorado_note
     """
     header = ["run_name", "format", "file_count", "data_size_bytes",
               "size_estimated", "directories", "notes",
               "flowcell_code", "sequencing_kit", "sample_rate",
-              "pore_type", "dorado_version"]
+              "pore_type", "dorado_version", "dorado_model", "dorado_note"]
     with open(output_path, "w") as fh:
         fh.write("\t".join(header) + "\n")
         for run_name, info in all_runs.items():
@@ -1383,6 +1475,8 @@ def write_stats_tsv(all_runs: dict, output_path: str) -> None:
                     str(chem.get("sample_rate", "")) if chem.get("sample_rate") else "",
                     chem_class.get("pore", ""),
                     chem_class.get("dorado_version", "") or "",
+                    chem_class.get("explicit_model", "") or "",
+                    chem_class.get("note", "") or "",
                 ]
                 fh.write("\t".join(row) + "\n")
 
@@ -1542,12 +1636,8 @@ def main():
                 rate = chem.get("sample_rate", 0)
                 rate_str = f", {rate} Hz" if rate else ""
                 print(f"  chemistry: {chem_class['pore']} ({chem['flowcell']}, {chem['kit']}{rate_str})")
-                if chem_class.get("dorado_version"):
-                    ver = chem_class["dorado_version"]
-                    print(f"  dorado: use version {ver}")
-                    if chem_class.get("note"):
-                        print(f"          {chem_class['note']}")
-                    print(f"  model: dorado basecaller {chem_class['model_hint']} <input>/")
+                for line in dorado_advice_lines(chem_class, result["formats"]):
+                    print(f"  {line}")
             print()
 
     # Process compressed archives in target folder as single_read_fast5

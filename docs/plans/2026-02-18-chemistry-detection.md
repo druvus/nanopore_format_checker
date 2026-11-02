@@ -1,5 +1,7 @@
 # Chemistry Detection Implementation Plan
 
+> **Superseded (2026-11):** the dorado recommendations in this historical plan are out of date (dorado never supported R10.3 or R10.4). See "Dorado version recommendations" in the README.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Detect flowcell chemistry from pod5/fast5 metadata and recommend the correct dorado version and basecalling model.

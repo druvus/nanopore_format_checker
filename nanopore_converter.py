@@ -235,6 +235,93 @@ def classify_fast5_dir(dir_path: str) -> str | None:
     return None
 
 
+def _first_fast5(directory: str) -> Path | None:
+    for dirpath, _, filenames in os.walk(directory):
+        for fname in filenames:
+            if fname.lower().endswith(".fast5"):
+                return Path(dirpath) / fname
+    return None
+
+
+# RunInfo fields dorado uses for automatic model selection, and the key each
+# one has in the chemistry dict produced by the format checker.
+_RUNINFO_FIELDS = (
+    ("flow_cell_product_code", "flowcell"),
+    ("sequencing_kit", "kit"),
+    ("sample_rate", "sample_rate"),
+)
+
+
+def fill_missing_pod5_metadata(pod5_dir: str, chemistry: dict) -> int:
+    """Fill empty flowcell/kit/sample-rate RunInfo fields in converted pod5.
+
+    `pod5 convert fast5` only reads tracking_id, so pod5 files converted
+    from older fast5 (flowcell stored only in context_tags/flowcell_type,
+    or kit only as experiment_kit) lack the fields dorado needs for
+    automatic model selection.  Values already present are never changed.
+    Best-effort: a file that cannot be patched is left as written and a
+    warning is logged.  Returns the number of files rewritten.
+    """
+    try:
+        import dataclasses
+        import pod5
+    except ImportError:
+        logger.warning("pod5 Python package not available; skipping metadata fill")
+        return 0
+    patched_files = 0
+    for p5 in sorted(Path(pod5_dir).rglob("*.pod5")):
+        tmp = p5.with_name(p5.name + ".tmp")
+        try:
+            with pod5.Reader(p5) as reader:
+                needs = any(
+                    not getattr(rec.run_info, field) and chemistry.get(key)
+                    for rec in reader.reads()
+                    for field, key in _RUNINFO_FIELDS
+                )
+            if not needs:
+                continue
+            patched = {}
+            with pod5.Reader(p5) as reader, pod5.Writer(tmp) as writer:
+                for rec in reader.reads():
+                    read = rec.to_read()
+                    acq = read.run_info.acquisition_id
+                    if acq not in patched:
+                        updates = {
+                            field: chemistry[key]
+                            for field, key in _RUNINFO_FIELDS
+                            if not getattr(read.run_info, field) and chemistry.get(key)
+                        }
+                        patched[acq] = dataclasses.replace(read.run_info, **updates)
+                    read.run_info = patched[acq]
+                    writer.add_read(read)
+            os.replace(tmp, p5)
+            patched_files += 1
+        except Exception as e:
+            logger.warning("Could not fill metadata in %s: %s", p5, e)
+            tmp.unlink(missing_ok=True)
+    return patched_files
+
+
+def _detect_chemistry(input_dir: str) -> dict | None:
+    """Read flowcell/kit/sample rate from one source fast5 (best-effort).
+
+    Reuses the format checker's multi-fallback extraction when it is
+    importable (it lives next to this script).
+    """
+    sample = _first_fast5(input_dir)
+    if sample is None:
+        return None
+    try:
+        from nanopore_format_checker import extract_chemistry_fast5
+    except ImportError:
+        logger.debug("nanopore_format_checker not importable; skipping metadata fill")
+        return None
+    try:
+        return extract_chemistry_fast5(sample)
+    except Exception:
+        return None
+
+
 def _has_fast5(directory: str) -> bool:
     for _, _, filenames in os.walk(directory):
         if any(f.lower().endswith(".fast5") for f in filenames):
@@ -278,6 +365,16 @@ def convert_run(
 
     try:
         _convert_to(fmt, input_dir, pod5_partial, multi_tmp, run_name, threads)
+        chemistry = _detect_chemistry(input_dir)
+        if chemistry:
+            n = fill_missing_pod5_metadata(pod5_partial, chemistry)
+            if n:
+                logger.info(
+                    "[%s] Filled missing pod5 metadata in %d file(s) "
+                    "(flowcell=%s, kit=%s, sample_rate=%s)", run_name, n,
+                    chemistry.get("flowcell"), chemistry.get("kit"),
+                    chemistry.get("sample_rate"),
+                )
     except BaseException:
         shutil.rmtree(pod5_partial, ignore_errors=True)
         raise
