@@ -12,7 +12,8 @@ Features:
   - Thread-safe progress reporting
   - Atomic writes (temp file + rename) to avoid partial outputs
   - Skips items already present in the output directory (safe re-runs)
-  - Graceful handling of permission errors (skips unreadable files)
+  - Graceful handling of permission errors (skips unreadable files and
+    directories, keeping the rest of the folder)
   - Fast --dry-run that does not scan file trees
 """
 
@@ -169,8 +170,8 @@ class ProgressTracker:
             )
         if self._permission_warnings:
             log.warning(
-                "Permission warnings: %d files were skipped inside archives "
-                "(unreadable files). Check source permissions if this is unexpected.",
+                "Permission warnings: %d unreadable files/directories were skipped "
+                "inside archives. Check source permissions if this is unexpected.",
                 self._permission_warnings,
             )
         if dry_run:
@@ -185,10 +186,50 @@ class ProgressTracker:
 # Task functions (each runs in its own thread)
 # ---------------------------------------------------------------------------
 
+def _add_tree(tar: tarfile.TarFile, src: Path, arcname: str, on_skip) -> None:
+    """Add a directory tree to an open tar, skipping anything unreadable.
+
+    Equivalent to tar.add(src, arcname) (sorted entries, symlinks stored as
+    links and never followed), except that a file that cannot be opened or a
+    directory that cannot be listed is reported via on_skip(arcname, error)
+    instead of aborting the whole archive.  An unreadable directory is still
+    stored as an (empty) directory entry so the tree structure is kept.
+    """
+    stack = [(str(src), arcname)]
+    while stack:
+        path, arc = stack.pop()
+        try:
+            tarinfo = tar.gettarinfo(path, arc)
+        except OSError as e:  # vanished or cannot be stat'ed
+            on_skip(arc, e)
+            continue
+        if tarinfo is None:  # sockets etc., which tar.add also ignores
+            continue
+        if tarinfo.isreg():
+            try:
+                fh = open(path, "rb")
+            except OSError as e:
+                on_skip(arc, e)
+                continue
+            with fh:
+                tar.addfile(tarinfo, fh)
+            continue
+        tar.addfile(tarinfo)
+        if tarinfo.isdir():
+            try:
+                children = sorted(os.listdir(path))
+            except OSError as e:
+                on_skip(arc + "/", e)
+                continue
+            # Reverse so the stack pops entries in sorted order
+            for child in reversed(children):
+                stack.append((os.path.join(path, child), f"{arc}/{child}"))
+
+
 def compress_directory(
     src: Path, dest_archive: Path, dry_run: bool, progress: ProgressTracker
 ) -> None:
-    """Compress a directory into a .tar.gz archive, skipping unreadable files."""
+    """Compress a directory into a .tar.gz archive, skipping unreadable files and directories."""
     name = src.name
     try:
         # Check if output already exists (fast skip for re-runs)
@@ -201,45 +242,34 @@ def compress_directory(
             progress.complete(name)
             return
 
+        # An unlistable top-level folder is an error, not an empty archive:
+        # an empty archive would be skipped as "output exists" on every re-run.
+        os.listdir(src)
+
         # Scan size (tolerant of permission errors)
         size, file_count = _dir_size(src)
         log.info("Compressing: %s (%s, %d files) → %s",
                  name, _format_size(size), file_count, dest_archive.name)
 
-        # Custom error handler for tar.add — logs and skips unreadable files
-        perm_errors = 0
+        skipped: list[str] = []
 
-        def _onerror(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
-            """Filter callback: skip files we can't read."""
-            nonlocal perm_errors
-            fpath = os.path.join(src, tarinfo.name) if not os.path.isabs(tarinfo.name) else tarinfo.name
-            if tarinfo.isfile():
-                try:
-                    with open(os.path.join(str(src.parent), tarinfo.name), "rb") as f:
-                        f.read(1)
-                except PermissionError:
-                    perm_errors += 1
-                    log.warning("    Permission denied, skipping: %s", tarinfo.name)
-                    return None
-                except OSError as e:
-                    perm_errors += 1
-                    log.warning("    OS error, skipping: %s (%s)", tarinfo.name, e)
-                    return None
-            return tarinfo
+        def _on_skip(arcname: str, err: OSError) -> None:
+            skipped.append(arcname)
+            log.warning("    Unreadable, skipping: %s (%s)", arcname, err.strerror or err)
 
         tmp = _atomic_tmp(dest_archive)
         try:
             with tarfile.open(tmp, "w:gz") as tar:
-                tar.add(src, arcname=name, filter=_onerror)
+                _add_tree(tar, src, name, _on_skip)
             tmp.rename(dest_archive)
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
 
-        if perm_errors:
-            for _ in range(perm_errors):
+        if skipped:
+            for _ in skipped:
                 progress.add_permission_warning()
-            log.warning("    %d files skipped due to permissions in %s", perm_errors, name)
+            log.warning("    %d unreadable files/directories skipped in %s", len(skipped), name)
 
         result_size = dest_archive.stat().st_size
         progress.complete(name, bytes_in=size, bytes_out=result_size)

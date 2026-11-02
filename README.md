@@ -126,6 +126,19 @@ The input list file supports one path per line (folders and archives can be mixe
 | 1 | Some conversions failed (summary printed) |
 | 2 | Fatal error (bad arguments, missing tools) |
 
+### Archiving run folders
+
+`compress_folders.py` packs every subfolder of an input directory into its own `.tar.gz` in an output directory (copying existing archives and recompressing plain `.tar` files), in parallel:
+
+```bash
+python compress_folders.py /data/raw /data/compressed --dry-run   # preview
+python compress_folders.py /data/raw /data/compressed -w 4        # 4 parallel workers
+```
+
+- **Safe re-runs:** each archive is written to a temp file and renamed into place when complete, and items whose archive already exists are skipped.
+- **Unreadable files and subfolders** are skipped with a warning and counted in the summary; the rest of the folder is still archived, and an unreadable subfolder is kept as an empty directory entry. A top-level folder that cannot be listed at all is reported as an error and no archive is written. Delete an archive to rebuild it after fixing permissions.
+- **Exit code** is 1 if any item failed.
+
 ## Format detection
 
 The tool identifies run directories by the `YYYYMMDD_` naming convention and searches for format-specific subdirectories up to 5 levels deep:
@@ -186,8 +199,11 @@ python test_optimizations.py
 
 # Converter tests (36 tests)
 python -m pytest test_nanopore_converter.py -v
+
+# Archiver tests (5 tests)
+python -m pytest test_compress_folders.py -v
 ```
 
-CI (`.github/workflows/tests.yml`) runs both suites with pytest on Python 3.12, 3.13 and 3.14 for every pull request and push to `main`.
+CI (`.github/workflows/tests.yml`) runs all three suites with pytest on Python 3.12, 3.13 and 3.14 for every pull request and push to `main`.
 
 The format checker tests cover format detection, chemistry extraction, the dorado support matrix, conversion script generation, and metadata patching. The converter tests cover input detection, archive extraction, fast5 classification, conversion logic, and end-to-end pipeline integration.
