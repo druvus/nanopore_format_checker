@@ -368,3 +368,136 @@ def test_extract_rejects_path_traversal(tmp_path):
     with pytest.raises(_tarfile.TarError):
         extract_archive(str(archive))
     assert not (Path(_tarfile.__file__).parent / "escaped.fast5").exists()
+
+
+# ---------------------------------------------------------------------------
+# Re-running into an existing output directory
+# ---------------------------------------------------------------------------
+
+def _fake_tools(monkeypatch, calls, fail_pod5=False):
+    """Mock subprocess.run: single_to_multi writes a batch, pod5 writes output.pod5."""
+    def mock_run(cmd, **kwargs):
+        calls.append(cmd)
+        _emulate_tool(cmd)
+        result = mock.Mock()
+        result.returncode = 0
+        result.stderr = ""
+        if cmd[0] == "pod5":
+            if fail_pod5:
+                result.returncode = 1
+                return result
+            out = Path(cmd[cmd.index("--output") + 1])
+            # Mimic pod5's refusal to overwrite an existing file
+            assert not (out / "output.pod5").exists(), "pod5 would refuse to overwrite"
+            (out / "output.pod5").write_bytes(b"new")
+        return result
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+
+
+def _make_run(tmp_path, name="run1"):
+    d = tmp_path / name
+    d.mkdir()
+    (d / "reads.fast5").write_bytes(b"x" * 2_000_000)  # multi-read by size
+    return d
+
+
+def test_rerun_skips_converted_input(tmp_path, monkeypatch):
+    from nanopore_converter import main
+    calls = []
+    _fake_tools(monkeypatch, calls)
+    run = _make_run(tmp_path)
+    out = tmp_path / "out"
+    assert main([str(run), "--output-dir", str(out)]) == 0
+    assert len(calls) == 1
+    assert (out / "run1" / "pod5" / "output.pod5").read_bytes() == b"new"
+    # Second run: nothing is converted, exit code still 0
+    assert main([str(run), "--output-dir", str(out)]) == 0
+    assert len(calls) == 1
+
+
+def test_rerun_skips_archive_without_extracting(tmp_path, monkeypatch):
+    from nanopore_converter import main
+    calls = []
+    _fake_tools(monkeypatch, calls)
+    src = _make_run(tmp_path, "20240101_run")
+    archive = tmp_path / "20240101_run.tar.gz"
+    with _tarfile.open(archive, "w:gz") as tar:
+        tar.add(src, arcname="20240101_run")
+    out = tmp_path / "out"
+    (out / "20240101_run" / "pod5").mkdir(parents=True)
+    (out / "20240101_run" / "pod5" / "output.pod5").write_bytes(b"old")
+    extracted = []
+    monkeypatch.setattr("nanopore_converter.extract_archive",
+                        lambda p: extracted.append(p) or str(tmp_path))
+    assert main([str(archive), "--output-dir", str(out)]) == 0
+    assert extracted == [] and calls == []
+
+
+def test_force_replaces_existing_output(tmp_path, monkeypatch):
+    from nanopore_converter import main
+    calls = []
+    _fake_tools(monkeypatch, calls)
+    run = _make_run(tmp_path)
+    pod5_dir = tmp_path / "out" / "run1" / "pod5"
+    pod5_dir.mkdir(parents=True)
+    (pod5_dir / "output.pod5").write_bytes(b"old")
+    assert main([str(run), "--output-dir", str(tmp_path / "out"), "--force"]) == 0
+    assert (pod5_dir / "output.pod5").read_bytes() == b"new"
+    assert sorted(p.name for p in pod5_dir.parent.iterdir()) == ["pod5"]
+
+
+def test_force_keeps_old_output_when_conversion_fails(tmp_path, monkeypatch):
+    from nanopore_converter import main
+    calls = []
+    _fake_tools(monkeypatch, calls, fail_pod5=True)
+    run = _make_run(tmp_path)
+    pod5_dir = tmp_path / "out" / "run1" / "pod5"
+    pod5_dir.mkdir(parents=True)
+    (pod5_dir / "output.pod5").write_bytes(b"old")
+    assert main([str(run), "--output-dir", str(tmp_path / "out"), "--force"]) == 1
+    assert (pod5_dir / "output.pod5").read_bytes() == b"old"
+    assert sorted(p.name for p in pod5_dir.parent.iterdir()) == ["pod5"]
+
+
+def test_failed_conversion_leaves_no_pod5_dir(tmp_path, monkeypatch):
+    """A failure must not create pod5/, or the next run would skip it as done."""
+    from nanopore_converter import is_converted, main
+    calls = []
+    _fake_tools(monkeypatch, calls, fail_pod5=True)
+    run = _make_run(tmp_path)
+    out = tmp_path / "out"
+    assert main([str(run), "--output-dir", str(out)]) == 1
+    assert not (out / "run1" / "pod5").exists()
+    assert not is_converted(str(out), "run1")
+
+
+def test_leftovers_from_interrupted_run_are_cleared(tmp_path, monkeypatch):
+    from nanopore_converter import convert_run
+    calls = []
+    _fake_tools(monkeypatch, calls)
+    run = tmp_path / "run1"
+    run.mkdir()
+    (run / "read.fast5").write_bytes(b"x" * 500)  # single-read by size
+    out = tmp_path / "out"
+    (out / "run1" / ".pod5_partial").mkdir(parents=True)
+    (out / "run1" / ".pod5_partial" / "output.pod5").write_bytes(b"partial")
+    (out / "run1" / "_multi_fast5_tmp").mkdir()
+    (out / "run1" / "_multi_fast5_tmp" / "stale.fast5").write_bytes(b"stale")
+    assert convert_run(str(run), str(out)) is True
+    assert (out / "run1" / "pod5" / "output.pod5").read_bytes() == b"new"
+    assert sorted(p.name for p in (out / "run1").iterdir()) == ["pod5"]
+
+
+def test_duplicate_output_names_in_one_invocation_fail(tmp_path, monkeypatch):
+    from nanopore_converter import main
+    calls = []
+    _fake_tools(monkeypatch, calls)
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    a = _make_run(tmp_path / "a")  # a/run1
+    b = _make_run(tmp_path / "b")  # b/run1 -> same output name
+    listf = tmp_path / "inputs.txt"
+    listf.write_text(f"{a}\n{b}\n")
+    assert main([str(listf), "--output-dir", str(tmp_path / "out")]) == 1
+    assert len(calls) == 1  # only the first one was converted

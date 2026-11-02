@@ -55,6 +55,13 @@ def parse_args(argv=None):
         help="Thread count for conversion tools (default: 4).",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-convert inputs whose output pod5/ folder already exists "
+             "(default: skip them). The old output is replaced only after "
+             "the new conversion succeeds.",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable detailed logging.",
@@ -73,6 +80,11 @@ def check_tools():
         logger.error("Install with: pip install ont_fast5_api pod5")
         sys.exit(2)
 
+
+# Working folders inside <output-dir>/<run>/ (removed after each conversion)
+PARTIAL_DIRNAME = ".pod5_partial"
+MULTI_TMP_DIRNAME = "_multi_fast5_tmp"
+OLD_DIRNAME = ".pod5_old"
 
 ARCHIVE_EXTENSIONS = (".tar.gz", ".tar.bz2", ".tgz", ".tar", ".zip")
 LIST_EXTENSIONS = {".txt", ".csv", ".list"}
@@ -241,6 +253,11 @@ def convert_run(
     run_name sets the output folder name (default: the input directory name).
     Returns False if the input contains no .fast5 files, True otherwise.
     Raises subprocess.CalledProcessError on conversion failure.
+
+    Output is written to a hidden <run>/.pod5_partial/ folder and moved to
+    <run>/pod5/ only once every step has succeeded, so an interrupted or
+    failed run never leaves a half-written pod5/ behind, and an existing
+    pod5/ is only replaced by a complete new conversion.
     """
     fmt = classify_fast5_dir(input_dir)
     if fmt is None:
@@ -248,13 +265,47 @@ def convert_run(
 
     if not run_name:
         run_name = Path(input_dir).resolve().name
-    pod5_out = os.path.join(output_base, run_name, "pod5")
-    os.makedirs(pod5_out, exist_ok=True)
+    run_out = os.path.join(output_base, run_name)
+    pod5_out = os.path.join(run_out, "pod5")
+    pod5_partial = os.path.join(run_out, PARTIAL_DIRNAME)
+    multi_tmp = os.path.join(run_out, MULTI_TMP_DIRNAME)
+    # Leftovers from an interrupted earlier run would otherwise be mixed in
+    for stale in (pod5_partial, multi_tmp):
+        if os.path.isdir(stale):
+            logger.info("[%s] Removing leftover %s", run_name, stale)
+            shutil.rmtree(stale)
+    os.makedirs(pod5_partial)
 
+    try:
+        _convert_to(fmt, input_dir, pod5_partial, multi_tmp, run_name, threads)
+    except BaseException:
+        shutil.rmtree(pod5_partial, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(multi_tmp, ignore_errors=True)
+
+    if os.path.isdir(pod5_out):
+        # Move the old output aside (fast rename) before swapping the new one
+        # in, then delete it, so pod5/ never disappears during a slow rmtree.
+        logger.info("[%s] Replacing existing output %s", run_name, pod5_out)
+        old_out = os.path.join(run_out, OLD_DIRNAME)
+        shutil.rmtree(old_out, ignore_errors=True)
+        os.replace(pod5_out, old_out)
+        os.replace(pod5_partial, pod5_out)
+        shutil.rmtree(old_out, ignore_errors=True)
+    else:
+        os.replace(pod5_partial, pod5_out)
+    logger.info("[%s] Conversion complete -> %s", run_name, pod5_out)
+    return True
+
+
+def _convert_to(
+    fmt: str, input_dir: str, pod5_out: str, multi_tmp: str, run_name: str, threads: int
+) -> None:
+    """Run the conversion tool(s) for one input, writing pod5 into pod5_out."""
     if fmt == "single_read_fast5":
         # Step 1: single -> multi
-        multi_tmp = os.path.join(output_base, run_name, "_multi_fast5_tmp")
-        os.makedirs(multi_tmp, exist_ok=True)
+        os.makedirs(multi_tmp)
         logger.info("[%s] Step 1/2: single_to_multi_fast5", run_name)
         result = subprocess.run(
             [
@@ -300,10 +351,6 @@ def convert_run(
                 result.returncode, "pod5 convert fast5"
             )
 
-        # Cleanup intermediate files
-        logger.info("[%s] Cleaning up intermediate multi_fast5.", run_name)
-        shutil.rmtree(multi_tmp, ignore_errors=True)
-
     elif fmt == "multi_read_fast5":
         logger.info("[%s] Converting multi_read_fast5 -> pod5", run_name)
         result = subprocess.run(
@@ -322,22 +369,33 @@ def convert_run(
                 result.returncode, "pod5 convert fast5"
             )
 
-    logger.info("[%s] Conversion complete -> %s", run_name, pod5_out)
-    return True
-
 
 def get_output_name(input_path: str) -> str:
     """Derive an output folder name from the input path.
 
-    Strips archive extensions to get a clean directory name.
+    Strips archive extensions to get a clean directory name.  The path is
+    resolved first so inputs such as "." or "run/" get a real name.
     """
-    name = Path(input_path).name
+    name = Path(input_path).resolve().name
     # Strip known archive suffixes
     for ext in ARCHIVE_EXTENSIONS:
         if name.lower().endswith(ext):
             name = name[: -len(ext)]
             break
     return name
+
+
+def is_converted(output_dir: str, run_name: str) -> bool:
+    """True if <output_dir>/<run_name>/pod5/ already holds .pod5 files.
+
+    pod5/ is only ever created by a fully successful conversion (see
+    convert_run), so its presence marks a finished earlier run.
+    """
+    pod5_out = Path(output_dir) / run_name / "pod5"
+    try:
+        return any(p.suffix == ".pod5" for p in pod5_out.rglob("*"))
+    except OSError:
+        return False
 
 
 def process_item(item_path: str, output_dir: str, threads: int = 4) -> bool:
@@ -362,7 +420,7 @@ def process_item(item_path: str, output_dir: str, threads: int = 4) -> bool:
             run_name = get_output_name(item_path)
         elif item_type == "directory":
             work_dir = item_path
-            run_name = get_output_name(str(Path(item_path).resolve()))
+            run_name = get_output_name(item_path)
         else:
             logger.error("Cannot process: %s (not a directory or archive)", item_path)
             return False
@@ -402,15 +460,35 @@ def main(argv=None):
     os.makedirs(args.output_dir, exist_ok=True)
 
     succeeded = 0
+    skipped = 0
     failed = 0
+    seen_names: dict[str, str] = {}
     for item in inputs:
         logger.info("Processing: %s", item)
+        run_name = get_output_name(item)
+        if run_name in seen_names:
+            # Two inputs in this invocation map to the same output folder;
+            # converting both would make the second overwrite (or skip) the first.
+            logger.error(
+                "Output name collision: %s and %s both map to %s; rename one of them.",
+                seen_names[run_name], item, os.path.join(args.output_dir, run_name),
+            )
+            failed += 1
+            continue
+        seen_names[run_name] = item
+        if not args.force and is_converted(args.output_dir, run_name):
+            logger.info(
+                "Skipping %s: already converted in %s (use --force to re-convert).",
+                item, os.path.join(args.output_dir, run_name, "pod5"),
+            )
+            skipped += 1
+            continue
         if process_item(item, args.output_dir, threads=args.threads):
             succeeded += 1
         else:
             failed += 1
 
-    logger.info("Done. %d succeeded, %d failed.", succeeded, failed)
+    logger.info("Done. %d converted, %d skipped, %d failed.", succeeded, skipped, failed)
     if failed > 0:
         return 1
     return 0

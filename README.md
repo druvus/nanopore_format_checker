@@ -82,6 +82,9 @@ python nanopore_converter.py input_list.txt --output-dir /scratch/converted
 
 # With more threads and verbose output
 python nanopore_converter.py /path/to/input --output-dir /scratch/converted --threads 8 --verbose
+
+# Re-convert inputs that were already converted
+python nanopore_converter.py input_list.txt --output-dir /scratch/converted --force
 ```
 
 The converter auto-detects the input type and fast5 format:
@@ -90,6 +93,8 @@ The converter auto-detects the input type and fast5 format:
 - **Compressed archives** (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tar`, `.zip`): safely extracted to a temp directory, converted, then cleaned up; output is named after the archive
 
 Output is written to `<output-dir>/<input_name>/pod5/`.
+
+Re-running is safe: inputs whose `pod5/` folder already holds `.pod5` files are skipped (archives are not even extracted), so an interrupted batch can simply be started again. Use `--force` to re-convert them. Each conversion is written to a hidden `.pod5_partial/` folder and only moved to `pod5/` once it succeeds, so a failed or interrupted conversion never leaves a half-written `pod5/` behind, and with `--force` the previous output is kept if the new conversion fails. Two inputs that map to the same output name in one invocation are reported as a failure.
 
 The input list file supports one path per line (folders and archives can be mixed), with blank lines and `#` comments skipped.
 
@@ -100,6 +105,7 @@ The input list file supports one path per line (folders and archives can be mixe
 | `input` | | Positional: folder, compressed archive, or text file listing paths |
 | `--output-dir DIR` | | Required. Base output directory for converted pod5 files |
 | `--threads N` | | Thread count for conversion tools (default: 4) |
+| `--force` | | Re-convert inputs that already have output (default: skip them) |
 | `--verbose` | `-v` | Enable detailed logging |
 
 #### Exit codes
@@ -153,7 +159,7 @@ Generated scripts handle:
 # Format checker tests (80 tests)
 python test_optimizations.py
 
-# Converter tests (27 tests)
+# Converter tests (34 tests)
 python -m pytest test_nanopore_converter.py -v
 ```
 
