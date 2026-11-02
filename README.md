@@ -157,4 +157,6 @@ python test_optimizations.py
 python -m pytest test_nanopore_converter.py -v
 ```
 
+CI (`.github/workflows/tests.yml`) runs both suites with pytest on Python 3.10, 3.12 and 3.13 for every pull request and push to `main`.
+
 The format checker tests cover format detection, chemistry extraction, conversion script generation, and metadata patching. The converter tests cover input detection, archive extraction, fast5 classification, conversion logic, and end-to-end pipeline integration.
