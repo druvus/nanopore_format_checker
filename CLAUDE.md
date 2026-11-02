@@ -61,6 +61,8 @@ python -m pytest test_nanopore_converter.py -v  # converter tests (36 tests)
 
 ## Dependencies
 
+Python 3.12 or newer is required; each script exits with an error on older versions (version guard right after the stdlib imports). CI tests 3.12, 3.13 and 3.14.
+
 ```bash
 pip install h5py ont_fast5_api pod5
 ```

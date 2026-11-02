@@ -29,6 +29,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
+if sys.version_info < (3, 12):
+    sys.exit(f"{Path(__file__).name} requires Python 3.12 or newer "
+             f"(running {sys.version.split()[0]})")
+
 COMPRESSED_EXTENSIONS = {
     ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
     ".zip", ".gz", ".bz2", ".xz", ".7z", ".rar",

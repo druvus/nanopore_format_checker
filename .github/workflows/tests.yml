@@ -19,8 +19,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The code uses PEP 604 unions (str | None), so 3.10 is the minimum.
-        python-version: ["3.10", "3.12", "3.13"]
+        # Python 3.12 is the minimum supported version.
+        python-version: ["3.12", "3.13", "3.14"]
 
     steps:
       - uses: actions/checkout@v5

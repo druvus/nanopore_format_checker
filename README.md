@@ -20,7 +20,7 @@ pip install h5py ont_fast5_api pod5
 
 `h5py` is the only hard dependency for the format checker. The converter requires `ont_fast5_api` (provides `single_to_multi_fast5`) and `pod5` (provides `pod5 convert fast5`) to be installed and on PATH.
 
-Requires Python 3.10+. On Python 3.13, `pip install ont_fast5_api` fails because its `progressbar33` dependency no longer builds; install it without dependencies and use the maintained `progressbar2` instead:
+Requires Python 3.12 or newer; the scripts exit with an error on older versions. On Python 3.13, `pip install ont_fast5_api` fails because its `progressbar33` dependency no longer builds; install it without dependencies and use the maintained `progressbar2` instead:
 
 ```bash
 pip install h5py pod5 progressbar2
@@ -188,6 +188,6 @@ python test_optimizations.py
 python -m pytest test_nanopore_converter.py -v
 ```
 
-CI (`.github/workflows/tests.yml`) runs both suites with pytest on Python 3.10, 3.12 and 3.13 for every pull request and push to `main`.
+CI (`.github/workflows/tests.yml`) runs both suites with pytest on Python 3.12, 3.13 and 3.14 for every pull request and push to `main`.
 
 The format checker tests cover format detection, chemistry extraction, the dorado support matrix, conversion script generation, and metadata patching. The converter tests cover input detection, archive extraction, fast5 classification, conversion logic, and end-to-end pipeline integration.

@@ -358,8 +358,6 @@ def test_extract_rejects_path_traversal(tmp_path):
     import io
     import pytest
     from nanopore_converter import extract_archive
-    if not hasattr(_tarfile, "data_filter"):
-        pytest.skip("tarfile extraction filters unavailable")
     archive = tmp_path / "evil.tar.gz"
     with _tarfile.open(archive, "w:gz") as tar:
         info = _tarfile.TarInfo("../escaped.fast5")

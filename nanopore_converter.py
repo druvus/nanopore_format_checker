@@ -26,6 +26,10 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+if sys.version_info < (3, 12):
+    sys.exit(f"{Path(__file__).name} requires Python 3.12 or newer "
+             f"(running {sys.version.split()[0]})")
+
 try:
     import h5py
     HAS_H5PY = True
@@ -127,11 +131,8 @@ def extract_archive(archive_path: str) -> str:
         if name.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar")):
             # "r:*" auto-detects gzip/bzip2/uncompressed
             with tarfile.open(archive_path, "r:*") as tar:
-                if hasattr(tarfile, "data_filter"):
-                    # Reject absolute paths, ".." traversal and device files
-                    tar.extractall(tmp_dir, filter="data")
-                else:  # Python < 3.10.12 / 3.11.4 without extraction filters
-                    tar.extractall(tmp_dir)
+                # Reject absolute paths, ".." traversal and device files
+                tar.extractall(tmp_dir, filter="data")
         elif name.endswith(".zip"):
             # zipfile sanitises absolute paths and ".." components itself
             with zipfile.ZipFile(archive_path, "r") as zf:
