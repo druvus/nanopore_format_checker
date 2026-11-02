@@ -4,11 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Two standalone Python CLI tools for Oxford Nanopore sequencing data:
+Standalone Python CLI tools for Oxford Nanopore sequencing data:
 
 - **`nanopore_format_checker.py`** -- Scans a folder of nanopore run directories and classifies each run by its read format (`pod5`, `multi_read_fast5`, `single_read_fast5`). Detects `fastq` output directories and compressed archives. Extracts flowcell chemistry (R9.4.1, R9.5.1, R10.3, R10.4, R10.4.1, RNA002, RNA004) from data file metadata and recommends the appropriate dorado version and model for basecalling. Optionally generates bash conversion scripts with post-conversion metadata patching.
 
 - **`nanopore_converter.py`** -- Converts fast5 files to pod5 format. Accepts a folder, compressed archive (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tar`, `.zip`), or a text file listing paths (one per line, mixed folders and archives). Handles the two-step single_read_fast5 conversion automatically (`single_to_multi_fast5` then `pod5 convert fast5`). Calls conversion tools as subprocesses.
+
+- **`compress_folders.py`** -- Archives each subfolder of an input directory into its own `.tar.gz` (copies existing archives, recompresses plain `.tar`), in parallel, with atomic writes and skip-if-exists re-runs. `_add_tree()` walks the tree itself instead of `tarfile.add()` so an unreadable file or subfolder is skipped and counted rather than failing the whole archive; an unlistable top-level folder is an error (an empty archive would be skipped forever on re-runs).
 
 ## Running
 
@@ -36,6 +38,7 @@ python nanopore_converter.py input_list.txt --output-dir /scratch/converted --th
 ```bash
 python test_optimizations.py          # format checker tests (81 tests)
 python -m pytest test_nanopore_converter.py -v  # converter tests (36 tests)
+python -m pytest test_compress_folders.py -v    # archiver tests (5; one is skipped when run as root)
 ```
 
 ### Format checker CLI flags

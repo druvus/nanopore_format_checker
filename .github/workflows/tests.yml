@@ -49,4 +49,4 @@ jobs:
           python compress_folders.py --help > /dev/null
 
       - name: Run tests
-        run: python -m pytest test_optimizations.py test_nanopore_converter.py -v
+        run: python -m pytest test_optimizations.py test_nanopore_converter.py test_compress_folders.py -v
