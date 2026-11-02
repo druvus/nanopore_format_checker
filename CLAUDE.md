@@ -35,7 +35,7 @@ python nanopore_converter.py input_list.txt --output-dir /scratch/converted --th
 
 ```bash
 python test_optimizations.py          # format checker tests (80 tests)
-python -m pytest test_nanopore_converter.py -v  # converter tests (27 tests)
+python -m pytest test_nanopore_converter.py -v  # converter tests (34 tests)
 ```
 
 ### Format checker CLI flags
@@ -56,6 +56,7 @@ python -m pytest test_nanopore_converter.py -v  # converter tests (27 tests)
 | `input` | | Positional: folder, compressed archive, or text file listing paths |
 | `--output-dir DIR` | | Required. Base output directory for converted pod5 files |
 | `--threads N` | | Thread count for conversion tools (default: 4) |
+| `--force` | | Re-convert inputs that already have output (default: skip them) |
 | `--verbose` | `-v` | Enable detailed logging |
 
 ## Dependencies
@@ -105,15 +106,16 @@ The tool searches for format-specific subdirectories (`pod5/`, `pod5_pass/`, `fa
 
 Single script that orchestrates format conversion via subprocess calls. Key functions:
 
-- `parse_args()` - CLI argument parsing (input, --output-dir, --threads, --verbose)
+- `parse_args()` - CLI argument parsing (input, --output-dir, --threads, --force, --verbose)
 - `check_tools()` - Verifies `single_to_multi_fast5` and `pod5` are on PATH; exits with code 2 if missing
 - `detect_input_type()` - Auto-detects whether input is a directory, archive (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tar`, `.zip`), or list file (`.txt`, `.csv`, `.list`)
 - `extract_archive()` - Extracts compressed archives to a temp directory (tar uses the `data` extraction filter to block path traversal); caller handles cleanup
 - `parse_list_file()` - Reads a text file of paths (one per line, skips blanks and `#` comments)
 - `resolve_inputs()` - Resolves the input argument to a flat list of paths to process
 - `classify_fast5_dir()` - Walks a directory, samples one `.fast5` file, classifies by HDF5 layout with the 1 MB size threshold as fallback (same approach as the format checker)
-- `convert_run()` - Core conversion: for single_read_fast5, runs `single_to_multi_fast5` then `pod5 convert fast5`; for multi_read_fast5, runs `pod5 convert fast5` directly. Raises if `single_to_multi_fast5` writes no output (it exits 0 even when every file fails). Cleans up intermediate multi_fast5 temp files
-- `get_output_name()` - Derives output folder name from input path, stripping archive extensions
+- `convert_run()` - Core conversion: for single_read_fast5, runs `single_to_multi_fast5` then `pod5 convert fast5`; for multi_read_fast5, runs `pod5 convert fast5` directly. Raises if `single_to_multi_fast5` writes no output (it exits 0 even when every file fails). Writes into `<run>/.pod5_partial/` and swaps it into `<run>/pod5/` only on success (old output is renamed aside, then deleted); clears leftovers from interrupted runs; always removes the intermediate `_multi_fast5_tmp/`
+- `get_output_name()` - Derives output folder name from the resolved input path, stripping archive extensions
+- `is_converted()` - True if `<output-dir>/<name>/pod5/` already holds `.pod5` files; `main()` skips such inputs unless `--force`, and fails duplicate output names within one invocation
 - `process_item()` - Orchestrates one input item (directory or archive) with try/except/finally cleanup of temp directories
 - `main()` - Entry point: parses args, checks tools, resolves inputs, iterates over items, tracks success/failure counts
 
@@ -124,7 +126,7 @@ single_read_fast5 -> single_to_multi_fast5 -> pod5 convert fast5 -> cleanup temp
 multi_read_fast5  -> pod5 convert fast5
 ```
 
-Output structure: `<output-dir>/<input_basename>/pod5/*.pod5`
+Output structure: `<output-dir>/<input_basename>/pod5/*.pod5`. A `pod5/` folder only exists after a fully successful conversion, which is what makes skip-on-rerun safe.
 
 ### Exit codes (converter)
 
