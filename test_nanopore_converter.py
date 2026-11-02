@@ -358,8 +358,6 @@ def test_extract_rejects_path_traversal(tmp_path):
     import io
     import pytest
     from nanopore_converter import extract_archive
-    if not hasattr(_tarfile, "data_filter"):
-        pytest.skip("tarfile extraction filters unavailable")
     archive = tmp_path / "evil.tar.gz"
     with _tarfile.open(archive, "w:gz") as tar:
         info = _tarfile.TarInfo("../escaped.fast5")
@@ -501,3 +499,62 @@ def test_duplicate_output_names_in_one_invocation_fail(tmp_path, monkeypatch):
     listf.write_text(f"{a}\n{b}\n")
     assert main([str(listf), "--output-dir", str(tmp_path / "out")]) == 1
     assert len(calls) == 1  # only the first one was converted
+
+
+# ---------------------------------------------------------------------------
+# Filling missing pod5 metadata (dorado automatic model selection needs it)
+# ---------------------------------------------------------------------------
+
+def _write_pod5(path, flowcell="", kit="", sample_rate=4000, n_reads=3):
+    import uuid
+    from datetime import datetime, timezone
+    import numpy as np
+    import pod5
+    now = datetime.now(timezone.utc)
+    run_info = pod5.RunInfo(
+        acquisition_id="acq1", acquisition_start_time=now, adc_max=4095, adc_min=-4096,
+        context_tags={}, experiment_name="", flow_cell_id="FAK1",
+        flow_cell_product_code=flowcell, protocol_name="", protocol_run_id="",
+        protocol_start_time=now, sample_id="", sample_rate=sample_rate,
+        sequencing_kit=kit, sequencer_position="", sequencer_position_type="",
+        software="", system_name="", system_type="", tracking_id={},
+    )
+    with pod5.Writer(path) as writer:
+        for _ in range(n_reads):
+            writer.add_read(pod5.Read(
+                read_id=uuid.uuid4(), pore=pod5.Pore(1, 1, "pore"),
+                calibration=pod5.Calibration(0.0, 1.0), read_number=1,
+                start_sample=0, median_before=200.0,
+                end_reason=pod5.EndReason.from_reason_with_default_forced(
+                    pod5.EndReasonEnum.SIGNAL_POSITIVE),
+                run_info=run_info, signal=np.zeros(100, dtype=np.int16),
+            ))
+
+
+def test_fill_missing_pod5_metadata_only_fills_empty_fields(tmp_path):
+    import pytest
+    pod5 = pytest.importorskip("pod5")
+    from nanopore_converter import fill_missing_pod5_metadata
+    d = tmp_path / "pod5"
+    d.mkdir()
+    _write_pod5(d / "output.pod5", flowcell="", kit="sqk-lsk109")
+    chem = {"flowcell": "FLO-MIN106", "kit": "SQK-OTHER", "sample_rate": 4000}
+    assert fill_missing_pod5_metadata(str(d), chem) == 1
+    with pod5.Reader(d / "output.pod5") as reader:
+        infos = [(r.run_info.flow_cell_product_code, r.run_info.sequencing_kit)
+                 for r in reader.reads()]
+    # flowcell filled; kit kept exactly as pod5 wrote it
+    assert infos == [("FLO-MIN106", "sqk-lsk109")] * 3
+    assert not list(d.glob("*.tmp"))
+    # Nothing missing any more -> file is not rewritten again
+    assert fill_missing_pod5_metadata(str(d), chem) == 0
+
+
+def test_fill_missing_pod5_metadata_never_raises(tmp_path):
+    from nanopore_converter import fill_missing_pod5_metadata
+    d = tmp_path / "pod5"
+    d.mkdir()
+    (d / "output.pod5").write_bytes(b"not a pod5 file")
+    assert fill_missing_pod5_metadata(str(d), {"flowcell": "FLO-MIN106"}) == 0
+    assert (d / "output.pod5").read_bytes() == b"not a pod5 file"
+    assert not list(d.glob("*.tmp"))

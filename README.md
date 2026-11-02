@@ -5,8 +5,8 @@ Tools for inspecting and converting Oxford Nanopore sequencing data.
 ## Features
 
 - **Format detection**: Classifies runs as `pod5`, `multi_read_fast5`, `single_read_fast5`, `fastq`, or compressed archives
-- **Chemistry detection**: Identifies pore type (R9.4.1, R10.3, R10.4, R10.4.1, RNA004) from flowcell codes, kit codes, or sample rate
-- **Dorado version guidance**: Recommends dorado 0.9.6 for R9.4.1/R10.3 data, dorado >=1.0 for R10.4.1
+- **Chemistry detection**: Identifies pore type (R9.4.1, R9.5.1, R10.3, R10.4, R10.4.1, RNA002, RNA004) from flowcell codes, kit codes, or sample rate
+- **Dorado version guidance**: Recommends dorado >=1.0 for R10.4.1 5 kHz and RNA004, dorado 0.9.6 for R9.4.1, R10.4.1 4 kHz and RNA002, and flags chemistries no dorado release supports (R10.3, R10.4)
 - **Conversion scripts**: Generates bash scripts for fast5-to-pod5 conversion with correct metadata
 - **Direct conversion**: Converts fast5 to pod5 directly, handling single-read and multi-read formats automatically
 - **Flexible input**: Accepts folders, compressed archives, or text files listing multiple inputs
@@ -19,6 +19,15 @@ pip install h5py ont_fast5_api pod5
 ```
 
 `h5py` is the only hard dependency for the format checker. The converter requires `ont_fast5_api` (provides `single_to_multi_fast5`) and `pod5` (provides `pod5 convert fast5`) to be installed and on PATH.
+
+Requires Python 3.12 or newer; the scripts exit with an error on older versions. On Python 3.13, `pip install ont_fast5_api` fails because its `progressbar33` dependency no longer builds; install it without dependencies and use the maintained `progressbar2` instead:
+
+```bash
+pip install h5py pod5 progressbar2
+pip install --no-deps ont_fast5_api
+```
+
+To basecall the results you need [dorado](https://github.com/nanoporetech/dorado): the version depends on the chemistry, see [Dorado version recommendations](#dorado-version-recommendations).
 
 ## Usage
 
@@ -90,6 +99,7 @@ python nanopore_converter.py input_list.txt --output-dir /scratch/converted --fo
 The converter auto-detects the input type and fast5 format:
 - **single_read_fast5**: runs `single_to_multi_fast5` then `pod5 convert fast5`, cleans up intermediate files (fails the item if the merge step produces no output)
 - **multi_read_fast5**: runs `pod5 convert fast5` directly
+- **Metadata fill**: after conversion, empty flowcell / kit / sample-rate fields in the pod5 RunInfo are filled from the source fast5 (values pod5 wrote are never changed). `pod5 convert` only reads `tracking_id`, so without this older runs that store the flowcell in `context_tags` lose it, and dorado's automatic model selection fails. Needs `nanopore_format_checker.py` next to the converter; skipped with a warning otherwise.
 - **Compressed archives** (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tar`, `.zip`): safely extracted to a temp directory, converted, then cleaned up; output is named after the archive
 
 Output is written to `<output-dir>/<input_name>/pod5/`.
@@ -131,19 +141,33 @@ Fast5 files are classified by inspecting the HDF5 root group of one sampled file
 
 Chemistry is extracted from one data file per run using a multi-level fallback:
 
-1. **Flowcell product code** from `context_tags` or `tracking_id` -- mapped via `FLOWCELL_PORE` table (23 flowcell codes)
-2. **Sequencing kit code** -- mapped via `KIT_PORE` table (35 kit codes) when flowcell is absent
+1. **Flowcell product code** from `context_tags` or `tracking_id` -- mapped via `FLOWCELL_PORE` table (21 flowcell codes)
+2. **Sequencing kit code** -- mapped via `KIT_PORE` table (55 kit codes) when flowcell is absent
 3. **Sample rate** -- last resort for very old runs with no metadata (5000 Hz = R10.4.1, all others = R9.4.1)
 
-### Supported pore types
+### Dorado version recommendations
 
-| Pore | Dorado version | Example flowcells |
-|------|---------------|-------------------|
-| R10.4.1 | >=1.0 | FLO-MIN114, FLO-PRO114, FLO-MIN114HD |
-| R10.4 | >=1.0 (5kHz) / 0.9.6 (4kHz) | FLO-MIN112, FLO-PRO112 |
-| R10.3 | 0.9.6 | FLO-MIN111 |
-| R9.4.1 | 0.9.6 | FLO-MIN106, FLO-MIN107, FLO-PRO002 |
-| RNA004 | >=1.0 | FLO-MIN004RA, FLO-PRO004RA |
+Dorado 1.0 (May 2025) removed R9.4.1, R10.4.1 4 kHz and RNA002 models, **and removed FAST5 input**. Dorado 0.9.6 is the last release that supports them. Dorado never shipped models for R10.3 or R10.4. Sources: the [dorado changelog](https://github.com/nanoporetech/dorado/blob/master/CHANGELOG.md) and the chemistry table in dorado 0.9.6 (`dorado/models/kits.cpp`).
+
+| Pore / condition | Dorado version | Example flowcells / kits | Explicit model (if auto-selection fails) |
+|------------------|----------------|--------------------------|------------------------------------------|
+| R10.4.1, 5 kHz | >=1.0 | FLO-MIN114, FLO-PRO114, FLO-MIN114HD | -- |
+| R10.4.1, 4 kHz (400 bps) | 0.9.6 | FLO-MIN114 + SQK-LSK114 at 4 kHz | `dna_r10.4.1_e8.2_400bps_sup@v4.1.0` |
+| R10.4.1, 260 bps | 0.9.6 | kits ending `-260` | `dna_r10.4.1_e8.2_260bps_sup@v4.1.0` |
+| R9.4.1 (4 kHz) | 0.9.6 | FLO-MIN106, FLO-PRO002, FLO-FLG001; Kit 9/10/11 | `dna_r9.4.1_e8_sup@v3.6` |
+| RNA002 | 0.9.6 | SQK-RNA002 | `rna002_70bps_hac@v3` (no sup model exists) |
+| RNA004 | >=1.0 | FLO-MIN004RA, FLO-PRO004RA, SQK-RNA004 | -- |
+| R10.4 | none (legacy Guppy) | FLO-MIN112, FLO-PRO112; Kit 12 | -- |
+| R10.3 | none (legacy Guppy) | FLO-MIN111 | -- |
+| R9.5.1 (DNA) | none (legacy Guppy) | FLO-MIN107 | -- |
+
+How to basecall once you know the version:
+
+- **dorado >=1.0** needs POD5 input. Convert fast5 runs first (`--convert-to pod5` or `nanopore_converter.py`), then run `dorado basecaller sup pod5_dir/ > calls.bam`.
+- **dorado 0.9.6** still reads fast5, but automatic model selection (`dorado basecaller sup ...`) only works on POD5 whose RunInfo has a flowcell + kit pair and sample rate that dorado recognises. Otherwise pass the explicit model name from the table, e.g. `dorado basecaller dna_r9.4.1_e8_sup@v3.6 reads/ > calls.bam`. The conversion scripts' metadata patching exists to make auto-selection work for old runs whose fast5 lacks these fields.
+- An R10.4.1 run whose sample rate could not be read is reported as `>=1.0` with a note to use 0.9.6 if it was sampled at 4 kHz. R9.4.1 runs at a rate other than 4 kHz (e.g. early 6 kHz PromethION) are flagged, as dorado's R9.4.1 model expects 4 kHz.
+
+`--verbose` prints this advice per run, and the TSV includes `dorado_version`, `dorado_model` and `dorado_note` columns.
 
 ## Conversion scripts
 
@@ -151,18 +175,19 @@ Generated scripts handle:
 
 - **multi_read_fast5 to pod5**: Direct conversion with `pod5 convert fast5 --threads 20 --recursive`
 - **single_read_fast5 to pod5**: Two-step workflow (`single_to_multi_fast5` then `pod5 convert fast5`)
-- **Metadata patching**: When chemistry was detected from the source fast5 files, the script includes a post-conversion step that injects the correct flowcell, kit, and sample rate into the pod5 RunInfo using the pod5 Python API. This is necessary for old runs where the converter produces pod5 files with empty or incorrect metadata.
+- **Metadata patching**: When chemistry was detected from the source fast5 files, the script includes a post-conversion step that writes the detected flowcell, kit, and sample rate into the pod5 RunInfo using the pod5 Python API. dorado's automatic model selection (`dorado basecaller sup ...`) looks these three fields up in its chemistry table, so without them older runs can only be basecalled with an explicit model name. A run with no flowcell code anywhere in its fast5 still needs the explicit model; the tool does not guess one.
+- **Unsupported conversions are not emitted**: runs whose data is only in compressed archives become `# SKIPPED` comments; `--convert-to single_fast5` only converts multi-read fast5.
 
 ## Tests
 
 ```bash
-# Format checker tests (80 tests)
+# Format checker tests (81 tests)
 python test_optimizations.py
 
-# Converter tests (34 tests)
+# Converter tests (36 tests)
 python -m pytest test_nanopore_converter.py -v
 ```
 
-CI (`.github/workflows/tests.yml`) runs both suites with pytest on Python 3.10, 3.12 and 3.13 for every pull request and push to `main`.
+CI (`.github/workflows/tests.yml`) runs both suites with pytest on Python 3.12, 3.13 and 3.14 for every pull request and push to `main`.
 
-The format checker tests cover format detection, chemistry extraction, conversion script generation, and metadata patching. The converter tests cover input detection, archive extraction, fast5 classification, conversion logic, and end-to-end pipeline integration.
+The format checker tests cover format detection, chemistry extraction, the dorado support matrix, conversion script generation, and metadata patching. The converter tests cover input detection, archive extraction, fast5 classification, conversion logic, and end-to-end pipeline integration.

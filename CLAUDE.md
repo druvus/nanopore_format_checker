@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Two standalone Python CLI tools for Oxford Nanopore sequencing data:
 
-- **`nanopore_format_checker.py`** -- Scans a folder of nanopore run directories and classifies each run by its read format (`pod5`, `multi_read_fast5`, `single_read_fast5`). Detects `fastq` output directories and compressed archives. Extracts flowcell chemistry (R9.4.1, R10.3, R10.4, R10.4.1, RNA004) from data file metadata and recommends the appropriate dorado version for basecalling. Optionally generates bash conversion scripts with post-conversion metadata patching.
+- **`nanopore_format_checker.py`** -- Scans a folder of nanopore run directories and classifies each run by its read format (`pod5`, `multi_read_fast5`, `single_read_fast5`). Detects `fastq` output directories and compressed archives. Extracts flowcell chemistry (R9.4.1, R9.5.1, R10.3, R10.4, R10.4.1, RNA002, RNA004) from data file metadata and recommends the appropriate dorado version and model for basecalling. Optionally generates bash conversion scripts with post-conversion metadata patching.
 
 - **`nanopore_converter.py`** -- Converts fast5 files to pod5 format. Accepts a folder, compressed archive (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tar`, `.zip`), or a text file listing paths (one per line, mixed folders and archives). Handles the two-step single_read_fast5 conversion automatically (`single_to_multi_fast5` then `pod5 convert fast5`). Calls conversion tools as subprocesses.
 
@@ -34,8 +34,8 @@ python nanopore_converter.py input_list.txt --output-dir /scratch/converted --th
 ### Tests
 
 ```bash
-python test_optimizations.py          # format checker tests (80 tests)
-python -m pytest test_nanopore_converter.py -v  # converter tests (34 tests)
+python test_optimizations.py          # format checker tests (81 tests)
+python -m pytest test_nanopore_converter.py -v  # converter tests (36 tests)
 ```
 
 ### Format checker CLI flags
@@ -61,6 +61,8 @@ python -m pytest test_nanopore_converter.py -v  # converter tests (34 tests)
 
 ## Dependencies
 
+Python 3.12 or newer is required; each script exits with an error on older versions (version guard right after the stdlib imports). CI tests 3.12, 3.13 and 3.14.
+
 ```bash
 pip install h5py ont_fast5_api pod5
 ```
@@ -81,9 +83,10 @@ Single script with no module structure. Key functions:
 - `fast_count_files()` / `estimate_dir_size()` - Uses `os.scandir` for performance with large directories (100k+ single-read fast5 files); sampling-based size estimation for very large directories
 - `diagnose_unknown()` - Gathers diagnostic info when a run matches no known format
 - `generate_conversion_script()` - Emits bash scripts using `pod5 convert` or `ont_fast5_api` tools; includes post-conversion metadata patching when chemistry was detected from source files
-- `write_stats_tsv()` - Writes per-run statistics to a TSV file (one row per format per run)
+- `write_stats_tsv()` - Writes per-run statistics to a TSV file (one row per format per run), including `dorado_version`, `dorado_model` and `dorado_note`
 - `extract_chemistry()` / `extract_chemistry_fast5()` / `extract_chemistry_pod5()` - Multi-fallback chemistry extraction from data files (one file per run)
-- `classify_chemistry()` - Maps flowcell/kit/sample-rate to pore type and recommends dorado version
+- `classify_chemistry()` - Maps flowcell/kit/sample-rate to pore type, dorado version (`None` when no dorado release supports it), model hint and explicit legacy model name (`DORADO_LEGACY_MODELS`)
+- `dorado_advice_lines()` - Verbose per-run dorado advice (version, fast5 vs pod5 input, auto-selection vs explicit model)
 
 ### Chemistry detection strategy
 
@@ -96,7 +99,7 @@ Chemistry extraction uses a multi-level fallback chain:
 
 For pod5 files, the same fallback applies to RunInfo fields, then `context_tags` and `tracking_id` dicts.
 
-Pore type inference: `FLOWCELL_PORE` table (23 entries) -> `KIT_PORE` table (35 entries) -> sample rate (exact 5000 Hz = R10.4.1, all others = R9.4.1). The sample-rate fallback only triggers when both flowcell and kit are empty.
+Pore type inference: `FLOWCELL_PORE` table (21 entries) -> `KIT_PORE` table (55 entries) -> sample rate (exact 5000 Hz = R10.4.1, all others = R9.4.1). The sample-rate fallback only triggers when both flowcell and kit are empty.
 
 ### Detection strategy
 
@@ -114,6 +117,7 @@ Single script that orchestrates format conversion via subprocess calls. Key func
 - `resolve_inputs()` - Resolves the input argument to a flat list of paths to process
 - `classify_fast5_dir()` - Walks a directory, samples one `.fast5` file, classifies by HDF5 layout with the 1 MB size threshold as fallback (same approach as the format checker)
 - `convert_run()` - Core conversion: for single_read_fast5, runs `single_to_multi_fast5` then `pod5 convert fast5`; for multi_read_fast5, runs `pod5 convert fast5` directly. Raises if `single_to_multi_fast5` writes no output (it exits 0 even when every file fails). Writes into `<run>/.pod5_partial/` and swaps it into `<run>/pod5/` only on success (old output is renamed aside, then deleted); clears leftovers from interrupted runs; always removes the intermediate `_multi_fast5_tmp/`
+- `fill_missing_pod5_metadata()` - After conversion, fills empty `flow_cell_product_code` / `sequencing_kit` / `sample_rate` in pod5 RunInfo from the source fast5 (via the checker's `extract_chemistry_fast5`); never overwrites, never fails the conversion
 - `get_output_name()` - Derives output folder name from the resolved input path, stripping archive extensions
 - `is_converted()` - True if `<output-dir>/<name>/pod5/` already holds `.pod5` files; `main()` skips such inputs unless `--force`, and fails duplicate output names within one invocation
 - `process_item()` - Orchestrates one input item (directory or archive) with try/except/finally cleanup of temp directories
@@ -145,6 +149,8 @@ Output structure: `<output-dir>/<input_basename>/pod5/*.pod5`. A `pod5/` folder 
 - Conversion scripts include pod5 metadata patching (via the pod5 Python API) when chemistry was detected from source fast5 files -- this corrects empty or incorrect metadata in converted pod5 files
 - Chemistry extraction is best-effort; failures never block format detection
 - Flowcell product codes are normalized to uppercase (fast5 stores them as lowercase bytes)
-- R9.4.1/R10.3 support was dropped in dorado 1.0; the tool recommends dorado 0.9.6 for these pore types
+- Dorado support matrix (verified against the dorado changelog and `dorado/models/kits.cpp`): >=1.0 supports R10.4.1 5 kHz and RNA004 only, with POD5 input only (FAST5 removed in 1.0.0); 0.9.6 is the last release with R9.4.1 (4 kHz), R10.4.1 4 kHz (400 and 260 bps) and RNA002; no dorado release supports R10.3, R10.4 (Kit 12) or DNA on R9.5.1 (FLO-MIN107) -- those get `dorado_version = None` and a Guppy note
+- dorado's automatic model selection looks up (flowcell, kit, sample_rate) from pod5 RunInfo (case-insensitive) in its chemistry table; that is why conversion patches/fills these fields. Never invent a flowcell code that the source data does not contain
+- RNA002 has no sup model (`model_hint` is `hac`)
 - `FLOWCELL_PORE` dict maps flowcell product codes to pore generations; update when new flowcells are released
 - `KIT_PORE` dict maps sequencing kit codes to pore types; used as fallback when flowcell code is absent
