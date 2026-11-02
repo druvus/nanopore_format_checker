@@ -26,6 +26,12 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+try:
+    import h5py
+    HAS_H5PY = True
+except ImportError:  # ont_fast5_api depends on h5py, so this is rare
+    HAS_H5PY = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,7 +74,7 @@ def check_tools():
         sys.exit(2)
 
 
-ARCHIVE_EXTENSIONS = {".tar.gz", ".tar.bz2", ".tgz", ".zip"}
+ARCHIVE_EXTENSIONS = (".tar.gz", ".tar.bz2", ".tgz", ".tar", ".zip")
 LIST_EXTENSIONS = {".txt", ".csv", ".list"}
 
 
@@ -105,16 +111,24 @@ def extract_archive(archive_path: str) -> str:
 
     logger.info("Extracting %s to %s", archive_path, tmp_dir)
 
-    if name.endswith((".tar.gz", ".tgz", ".tar.bz2")):
-        mode = "r:gz" if name.endswith((".tar.gz", ".tgz")) else "r:bz2"
-        with tarfile.open(archive_path, mode) as tar:
-            tar.extractall(tmp_dir)
-    elif name.endswith(".zip"):
-        with zipfile.ZipFile(archive_path, "r") as zf:
-            zf.extractall(tmp_dir)
-    else:
-        shutil.rmtree(tmp_dir)
-        raise ValueError(f"Unsupported archive format: {archive_path}")
+    try:
+        if name.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar")):
+            # "r:*" auto-detects gzip/bzip2/uncompressed
+            with tarfile.open(archive_path, "r:*") as tar:
+                if hasattr(tarfile, "data_filter"):
+                    # Reject absolute paths, ".." traversal and device files
+                    tar.extractall(tmp_dir, filter="data")
+                else:  # Python < 3.10.12 / 3.11.4 without extraction filters
+                    tar.extractall(tmp_dir)
+        elif name.endswith(".zip"):
+            # zipfile sanitises absolute paths and ".." components itself
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                zf.extractall(tmp_dir)
+        else:
+            raise ValueError(f"Unsupported archive format: {archive_path}")
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
 
     return tmp_dir
 
@@ -148,10 +162,43 @@ def resolve_inputs(input_path: str) -> list[str]:
         return []
 
 
+def _classify_fast5_structure(fpath: Path) -> str | None:
+    """Classify a fast5 file by its HDF5 layout; None if undeterminable.
+
+    Multi-read files have top-level read_<uuid> groups (and usually a
+    file_type=multi-read attribute); single-read files have Raw/ and
+    UniqueGlobalKey/ at the root.
+    """
+    if not HAS_H5PY:
+        return None
+    try:
+        with h5py.File(fpath, "r") as f:
+            file_type = f.attrs.get("file_type")
+            if file_type is not None:
+                if isinstance(file_type, bytes):
+                    file_type = file_type.decode("utf-8", errors="replace")
+                file_type = str(file_type).lower()
+                if file_type.startswith("multi"):
+                    return "multi_read_fast5"
+                if file_type.startswith("single"):
+                    return "single_read_fast5"
+            for key in f:
+                if key.startswith("read_"):
+                    return "multi_read_fast5"
+            if "Raw" in f or "UniqueGlobalKey" in f:
+                return "single_read_fast5"
+    except Exception:
+        return None
+    return None
+
+
 def classify_fast5_dir(dir_path: str) -> str | None:
     """Classify a directory of fast5 files as single_read or multi_read.
 
-    Samples one .fast5 file and uses the 1 MB size threshold:
+    Samples one .fast5 file.  When h5py is available the HDF5 layout is
+    inspected (reliable for small multi-read files, e.g. fast5_fail/).
+    Otherwise, or if the file cannot be parsed, the 1 MB size threshold
+    is used:
     - < 1 MB: single_read_fast5
     - >= 1 MB: multi_read_fast5
 
@@ -162,6 +209,9 @@ def classify_fast5_dir(dir_path: str) -> str | None:
         for fname in filenames:
             if fname.lower().endswith(".fast5"):
                 fpath = Path(dirpath) / fname
+                by_structure = _classify_fast5_structure(fpath)
+                if by_structure is not None:
+                    return by_structure
                 try:
                     size = fpath.stat().st_size
                 except OSError:
@@ -173,20 +223,31 @@ def classify_fast5_dir(dir_path: str) -> str | None:
     return None
 
 
-def convert_run(input_dir: str, output_base: str, threads: int = 4) -> None:
+def _has_fast5(directory: str) -> bool:
+    for _, _, filenames in os.walk(directory):
+        if any(f.lower().endswith(".fast5") for f in filenames):
+            return True
+    return False
+
+
+def convert_run(
+    input_dir: str, output_base: str, threads: int = 4, run_name: str | None = None
+) -> bool:
     """Convert a single run directory from fast5 to pod5.
 
     For single_read_fast5: two-step process via intermediate multi_read_fast5.
     For multi_read_fast5: direct pod5 conversion.
 
+    run_name sets the output folder name (default: the input directory name).
+    Returns False if the input contains no .fast5 files, True otherwise.
     Raises subprocess.CalledProcessError on conversion failure.
     """
     fmt = classify_fast5_dir(input_dir)
     if fmt is None:
-        logger.warning("No .fast5 files found in %s, skipping.", input_dir)
-        return
+        return False
 
-    run_name = Path(input_dir).name
+    if not run_name:
+        run_name = Path(input_dir).resolve().name
     pod5_out = os.path.join(output_base, run_name, "pod5")
     os.makedirs(pod5_out, exist_ok=True)
 
@@ -209,6 +270,16 @@ def convert_run(input_dir: str, output_base: str, threads: int = 4) -> None:
             logger.error("single_to_multi_fast5 failed:\n%s", result.stderr)
             raise subprocess.CalledProcessError(
                 result.returncode, "single_to_multi_fast5"
+            )
+        # single_to_multi_fast5 logs per-file errors (e.g. when given
+        # multi-read files) but still exits 0; make sure it produced output.
+        if not _has_fast5(multi_tmp):
+            logger.error(
+                "single_to_multi_fast5 produced no output for %s:\n%s",
+                input_dir, result.stderr,
+            )
+            raise subprocess.CalledProcessError(
+                1, "single_to_multi_fast5", stderr="no multi-read fast5 written"
             )
 
         # Step 2: multi -> pod5
@@ -252,6 +323,7 @@ def convert_run(input_dir: str, output_base: str, threads: int = 4) -> None:
             )
 
     logger.info("[%s] Conversion complete -> %s", run_name, pod5_out)
+    return True
 
 
 def get_output_name(input_path: str) -> str:
@@ -261,7 +333,7 @@ def get_output_name(input_path: str) -> str:
     """
     name = Path(input_path).name
     # Strip known archive suffixes
-    for ext in (".tar.gz", ".tar.bz2", ".tgz", ".zip"):
+    for ext in ARCHIVE_EXTENSIONS:
         if name.lower().endswith(ext):
             name = name[: -len(ext)]
             break
@@ -286,13 +358,18 @@ def process_item(item_path: str, output_dir: str, threads: int = 4) -> bool:
             entries = list(Path(tmp_dir).iterdir())
             if len(entries) == 1 and entries[0].is_dir():
                 work_dir = str(entries[0])
+            # Name the output after the archive, not the temp directory
+            run_name = get_output_name(item_path)
         elif item_type == "directory":
             work_dir = item_path
+            run_name = get_output_name(str(Path(item_path).resolve()))
         else:
             logger.error("Cannot process: %s (not a directory or archive)", item_path)
             return False
 
-        convert_run(work_dir, output_dir, threads=threads)
+        if not convert_run(work_dir, output_dir, threads=threads, run_name=run_name):
+            logger.error("No .fast5 files found in %s", item_path)
+            return False
         return True
 
     except subprocess.CalledProcessError as e:

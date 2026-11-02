@@ -1,0 +1,52 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The code uses PEP 604 unions (str | None), so 3.10 is the minimum.
+        python-version: ["3.10", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+
+      # The converter's external tools (single_to_multi_fast5, pod5 CLI) are
+      # mocked in the tests, so ont_fast5_api is not needed here.  h5py and
+      # pod5 are used to build and read real fast5/pod5 files.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-test.txt
+
+      - name: Byte-compile scripts
+        run: python -m compileall -q nanopore_format_checker.py nanopore_converter.py compress_folders.py
+
+      - name: CLI smoke test
+        run: |
+          python nanopore_format_checker.py --help > /dev/null
+          python nanopore_converter.py --help > /dev/null
+          python compress_folders.py --help > /dev/null
+
+      - name: Run tests
+        run: python -m pytest test_optimizations.py test_nanopore_converter.py -v

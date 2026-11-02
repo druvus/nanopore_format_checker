@@ -1,0 +1,4 @@
+# Test dependencies (CI). The converter's external CLI tools are mocked in tests.
+h5py
+pod5
+pytest

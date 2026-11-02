@@ -433,14 +433,14 @@ def test_find_named_subdirs_skips_matched(tmp_path: Path) -> None:
 def test_has_file_with_ext_budget(tmp_path: Path) -> None:
     """Verify _has_file_with_ext stops searching after budget is exhausted."""
     d = tmp_path / "20240101_run_budget"
-    d.mkdir(parents=True)
-    # Create 20 non-matching files
-    for i in range(20):
-        make_file(d / f"file_{i:04d}.txt", size=10)
-    # Place a matching file that would only be found after budget runs out
-    make_file(d / "zzz_last.fast5", size=10)
+    # Put the matching file at the bottom of a 4-deep directory chain (within
+    # the default max_depth of 5).  Each level holds exactly one entry, so
+    # reaching the file always costs 5 entries -- independent of the
+    # filesystem's directory listing order.
+    deep = d / "a" / "b" / "c" / "d"
+    make_file(deep / "last.fast5", size=10)
 
-    # With budget of 5, should not find the .fast5 file (it comes after many .txt files)
+    # With budget of 5, should not find the .fast5 file
     found = _has_file_with_ext(d, ".fast5", max_entries=5)
     assert not found, "Should not find .fast5 with budget=5"
 
@@ -748,7 +748,7 @@ def test_generate_conversion_with_metadata_patch(tmp_path: Path) -> None:
     assert "Patching pod5 metadata" in script, "Should patch metadata"
     assert "FLO-MIN106" in script, "Should inject flowcell code"
     assert "SQK-LSK109" in script, "Should inject kit code"
-    assert "sample_rate = 4000" in script, "Should inject sample_rate"
+    assert "'sample_rate': 4000" in script, "Should inject sample_rate"
     assert "import pod5" in script, "Should use pod5 Python API"
     assert "PATCH_EOF" in script, "Should use here-document"
     print("  PASS: generate_conversion_script with metadata patch")
@@ -770,7 +770,7 @@ def test_generate_conversion_multi_with_metadata_patch(tmp_path: Path) -> None:
     }
     script = generate_conversion_script(runs, "pod5")
     assert "Patching pod5 metadata" in script, "Should patch metadata"
-    assert "sample_rate = 4000" in script, "Should inject sample_rate"
+    assert "'sample_rate': 4000" in script, "Should inject sample_rate"
     # Empty flowcell/kit should not generate assignment lines
     assert "flow_cell_product_code" not in script, "Should not set empty flowcell"
     assert "sequencing_kit" not in script, "Should not set empty kit"
@@ -1253,6 +1253,146 @@ def test_tsv_includes_chemistry_columns(tmp_path: Path) -> None:
     print("  PASS: TSV includes chemistry columns")
 
 
+
+# ---------------------------------------------------------------------------
+# Regression tests from the code audit
+# ---------------------------------------------------------------------------
+
+def _make_multi_read_fast5(path: Path, n_reads: int = 3) -> None:
+    """Write a small (<1 MB) multi-read fast5 with read_<id> groups."""
+    import h5py
+    import numpy as np
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as f:
+        f.attrs["file_type"] = "multi-read"
+        for i in range(n_reads):
+            grp = f.create_group(f"read_0000000{i}-0000-0000-0000-000000000000")
+            grp.create_group("Raw").create_dataset(
+                "Signal", data=np.zeros(100, dtype=np.int16))
+            grp.create_group("channel_id").attrs["sampling_rate"] = 4000.0
+
+
+def test_small_multi_read_fast5_by_structure(tmp_path: Path) -> None:
+    """A multi-read fast5 under 1 MB must not be classified as single-read."""
+    run = tmp_path / "20240101_run_small_multi"
+    _make_multi_read_fast5(run / "fast5_fail" / "batch_0.fast5")
+    assert (run / "fast5_fail" / "batch_0.fast5").stat().st_size < 1_000_000
+    result = analyze_run(run)
+    assert result["formats"] == ["multi_read_fast5"], result["formats"]
+
+    # Same for files directly in the run root
+    run2 = tmp_path / "20240101_run_small_multi_root"
+    _make_multi_read_fast5(run2 / "batch_0.fast5")
+    result = analyze_run(run2)
+    assert result["formats"] == ["multi_read_fast5"], result["formats"]
+    print("  PASS: small multi-read fast5 classified by HDF5 structure")
+
+
+def test_pod5_run_with_gz_summary_not_archive(tmp_path: Path) -> None:
+    """A gzipped summary next to pod5 data must not add single_read_fast5."""
+    run = tmp_path / "20240101_run_pod5_gzsummary"
+    make_file(run / "pod5" / "reads.pod5", size=1000)
+    make_file(run / "sequencing_summary_ABC.txt.gz", size=100)
+    result = analyze_run(run)
+    assert result["formats"] == ["pod5"], result["formats"]
+
+    # A multi-read run in fast5_pass/ with a tarball is not an archive run either
+    run2 = tmp_path / "20240101_run_multi_tar"
+    make_file(run2 / "fast5_pass" / "batch.fast5", size=2_000_000)
+    make_file(run2 / "old_reads.tar.gz", size=100)
+    result = analyze_run(run2)
+    assert result["formats"] == ["multi_read_fast5"], result["formats"]
+    print("  PASS: gz summary not treated as archive")
+
+
+def test_is_raw_archive(tmp_path: Path) -> None:
+    from nanopore_format_checker import is_raw_archive
+    for name in ("run.tar", "run.tar.gz", "run.tgz", "reads.gz", "RUN.TAR.GZ"):
+        assert is_raw_archive(name), name
+    for name in ("sequencing_summary.txt.gz", "reads.fastq.gz", "x.fq.gz",
+                 "report.json.gz", "notes.txt", "reads.pod5"):
+        assert not is_raw_archive(name), name
+    print("  PASS: is_raw_archive")
+
+
+def test_conversion_script_quoting_and_archives(tmp_path: Path) -> None:
+    """Paths with quotes must be escaped; archive-only runs are skipped."""
+    import subprocess
+    runs = {
+        "20240101_it's_run": {
+            "formats": ["multi_read_fast5"],
+            "details": {"multi_read_fast5": {"directories": []}},
+            "run_path": "/data/20240101_it's_run",
+        },
+        "20240101_archived": {
+            "formats": ["single_read_fast5"],
+            "details": {"single_read_fast5": {
+                "directories": ["/data"], "archive_files": ["20240101_archived.tar.gz"]}},
+        },
+    }
+    script = generate_conversion_script(runs, "pod5")
+    assert "'/data/20240101_it'\"'\"'s_run/'" in script, script
+    assert "SKIPPED 20240101_archived" in script
+    assert "single_to_multi_fast5" not in script
+    check = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
+    assert check.returncode == 0, check.stderr
+    print("  PASS: conversion script quoting and archive skipping")
+
+
+def _make_pod5(path: Path, n_reads: int = 3) -> None:
+    import uuid
+    from datetime import datetime, timezone
+    import numpy as np
+    import pod5
+    run_info = pod5.RunInfo(
+        acquisition_id="acq1", acquisition_start_time=datetime.now(timezone.utc),
+        adc_max=4095, adc_min=-4096, context_tags={}, experiment_name="",
+        flow_cell_id="FAK1", flow_cell_product_code="", protocol_name="",
+        protocol_run_id="", protocol_start_time=datetime.now(timezone.utc),
+        sample_id="", sample_rate=4000, sequencing_kit="", sequencer_position="",
+        sequencer_position_type="", software="", system_name="", system_type="",
+        tracking_id={},
+    )
+    with pod5.Writer(path) as writer:
+        for _ in range(n_reads):
+            writer.add_read(pod5.Read(
+                read_id=uuid.uuid4(), pore=pod5.Pore(1, 1, "pore"),
+                calibration=pod5.Calibration(0.0, 1.0), read_number=1,
+                start_sample=0, median_before=200.0,
+                end_reason=pod5.EndReason.from_reason_with_default_forced(
+                    pod5.EndReasonEnum.SIGNAL_POSITIVE),
+                run_info=run_info,
+                signal=np.zeros(100, dtype=np.int16),
+            ))
+
+
+def test_metadata_patch_executes(tmp_path: Path) -> None:
+    """Run the generated metadata patch against a real pod5 file."""
+    import subprocess
+    try:
+        import pod5
+    except ImportError:
+        print("  SKIP: metadata patch execution (pod5 not installed)")
+        return
+    from nanopore_format_checker import _pod5_metadata_fix_lines
+    out = tmp_path / "patch_me" / "pod5"
+    out.mkdir(parents=True)
+    _make_pod5(out / "output.pod5")
+    chem = {"flowcell": "FLO-MIN106", "kit": "SQK-LSK109", "sample_rate": 4000}
+    script = "set -euo pipefail\n" + "\n".join(_pod5_metadata_fix_lines(str(out), chem))
+    res = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+    assert "failed to patch" not in res.stdout, res.stdout
+    with pod5.Reader(out / "output.pod5") as reader:
+        reads = list(reader.reads())
+        assert len(reads) == 3
+        for r in reads:
+            assert r.run_info.flow_cell_product_code == "FLO-MIN106"
+            assert r.run_info.sequencing_kit == "SQK-LSK109"
+    assert not list(out.glob("*.tmp"))
+    print("  PASS: metadata patch executes against real pod5")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -1334,6 +1474,11 @@ def main():
         test_fast5_barcoded_sampling,
         test_fast5_barcoded_multi_read,
         test_tsv_includes_chemistry_columns,
+        test_small_multi_read_fast5_by_structure,
+        test_pod5_run_with_gz_summary_not_archive,
+        test_is_raw_archive,
+        test_conversion_script_quoting_and_archives,
+        test_metadata_patch_executes,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:
