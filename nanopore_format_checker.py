@@ -111,6 +111,35 @@ KIT_PORE = {
 }
 
 
+# Gzipped files that are clearly not raw-signal archives (MinKNOW summaries,
+# basecalled reads, reports).  These must not be mistaken for compressed
+# single-read fast5 archives.
+NON_RAW_GZ_SUFFIXES = (
+    ".fastq.gz", ".fq.gz", ".fasta.gz", ".fa.gz", ".bam.gz", ".sam.gz",
+    ".txt.gz", ".tsv.gz", ".csv.gz", ".json.gz", ".html.gz", ".md.gz",
+    ".log.gz", ".pdf.gz",
+)
+
+
+def is_raw_archive(filename: str) -> bool:
+    """Return True if a filename looks like a compressed raw-data archive.
+
+    Accepts .tar, .tar.gz, .tgz and plain .gz files, but rejects gzipped
+    text/sequence outputs such as sequencing_summary.txt.gz or reads.fastq.gz.
+    """
+    name = filename.lower()
+    if name.endswith((".tar", ".tar.gz", ".tgz")):
+        return True
+    if name.endswith(".gz"):
+        return not name.endswith(NON_RAW_GZ_SUFFIXES)
+    return False
+
+
+def _sh_quote(value: str) -> str:
+    """Always single-quote a string for bash, escaping embedded single quotes."""
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
 def is_nanopore_run_dir(dirname: str) -> bool:
     """Check if directory name matches nanopore run naming convention (starts with date)."""
     return bool(re.match(r"^\d{8}_", dirname))
@@ -348,14 +377,49 @@ def classify_fast5_by_size(fast5_file: Path) -> str:
         return "fast5_unknown"
 
 
+def classify_fast5_by_structure(fast5_file: Path) -> str | None:
+    """
+    Determine single vs multi-read by inspecting the HDF5 layout (needs h5py).
+
+    Multi-read files have top-level ``read_<uuid>`` groups (and usually a
+    ``file_type = multi-read`` root attribute); single-read files have
+    ``Raw/`` and ``UniqueGlobalKey/`` at the top level.  Only the root group
+    is read, so this costs a single file open.
+
+    Returns None when h5py is unavailable or the file cannot be parsed.
+    """
+    if not HAS_H5PY:
+        return None
+    try:
+        with h5py.File(fast5_file, "r") as f:
+            file_type = f.attrs.get("file_type")
+            if file_type is not None:
+                file_type = _decode_attr(file_type).lower()
+                if file_type.startswith("multi"):
+                    return "multi_read_fast5"
+                if file_type.startswith("single"):
+                    return "single_read_fast5"
+            for key in f:
+                if key.startswith("read_"):
+                    return "multi_read_fast5"
+            if "Raw" in f or "UniqueGlobalKey" in f:
+                return "single_read_fast5"
+    except Exception:
+        return None
+    return None
+
+
 def classify_fast5(fast5_file: Path) -> str:
     """
     Determine if a fast5 file is single-read or multi-read.
 
-    Uses file size heuristic for speed - single-read files are typically <1MB,
-    multi-read files are typically >1MB.
+    Inspects the HDF5 root group when h5py is available (one file open),
+    which correctly handles small multi-read files such as those in
+    fast5_fail/ or short runs.  Falls back to the file size heuristic
+    (single-read <1MB, multi-read >=1MB) when h5py is missing or the file
+    cannot be parsed.
     """
-    return classify_fast5_by_size(fast5_file)
+    return classify_fast5_by_structure(fast5_file) or classify_fast5_by_size(fast5_file)
 
 
 def _decode_attr(val):
@@ -881,10 +945,8 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
                 for entry in it:
                     # Check for .fast5 file in root (just need one for classification)
                     if not sample_file and entry.is_file(follow_symlinks=False) and entry.name.endswith(".fast5"):
-                        # Quick size check
-                        size_bytes = entry.stat(follow_symlinks=False).st_size
-                        classification = "single_read_fast5" if size_bytes < 1_000_000 else "multi_read_fast5"
                         sample_file = Path(entry.path)
+                        classification = classify_fast5(sample_file)
                         fast5_in_root = True
                     # Check for numeric subdirectory
                     elif not has_numeric_dirs and entry.is_dir(follow_symlinks=False) and re.match(r"^\d+$", entry.name):
@@ -895,9 +957,8 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
                                 with os.scandir(entry.path) as sub_it:
                                     for sub_entry in sub_it:
                                         if sub_entry.is_file(follow_symlinks=False) and sub_entry.name.endswith(".fast5"):
-                                            size_bytes = sub_entry.stat(follow_symlinks=False).st_size
-                                            classification = "single_read_fast5" if size_bytes < 1_000_000 else "multi_read_fast5"
                                             sample_file = Path(sub_entry.path)
+                                            classification = classify_fast5(sample_file)
                                             break
                             except PermissionError:
                                 pass
@@ -937,15 +998,15 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
                 result["details"]["fast5_unknown"] = fast5_info
 
     # --- Check for compressed archives (tar, gz, tar.gz) -- treat as single_read_fast5 ---
-    if not fast5_dirs and "single_read_fast5" not in result["formats"]:
-        archive_exts = (".tar", ".gz", ".tar.gz", ".tgz")
+    # Only when no raw data (pod5/fast5) was found: a pod5 or fast5 run that
+    # merely contains e.g. sequencing_summary.txt.gz is not an archive run.
+    raw_formats = ("pod5", "single_read_fast5", "multi_read_fast5", "fast5_unknown")
+    if not all_fast5_dirs and not any(f in result["formats"] for f in raw_formats):
         archives = []
         try:
             with os.scandir(run_path) as it:
                 for entry in it:
-                    if entry.is_file(follow_symlinks=False) and any(
-                        entry.name.endswith(ext) for ext in archive_exts
-                    ):
+                    if entry.is_file(follow_symlinks=False) and is_raw_archive(entry.name):
                         archives.append(Path(entry.path))
         except PermissionError:
             pass
@@ -1112,49 +1173,66 @@ def _pod5_metadata_fix_lines(pod5_dir: str, chemistry: dict) -> list[str]:
     Rewrites each pod5 file in pod5_dir, injecting the detected flowcell,
     kit, and sample_rate into RunInfo.  This is necessary for old fast5 runs
     where the converter produces pod5 files with empty or incorrect metadata.
+
+    pod5.RunInfo is a frozen dataclass, so a patched copy is built with
+    dataclasses.replace() (once per acquisition) and assigned to each Read.
     """
     flowcell = chemistry.get("flowcell", "")
     kit = chemistry.get("kit", "")
     sample_rate = chemistry.get("sample_rate", 0)
     if not flowcell and not kit and not sample_rate:
         return []
+    updates = {}
+    if flowcell:
+        updates["flow_cell_product_code"] = flowcell
+    if kit:
+        updates["sequencing_kit"] = kit
+    if sample_rate:
+        updates["sample_rate"] = int(sample_rate)
+    summary = f"flowcell={flowcell}, kit={kit}, sample_rate={sample_rate}"
     lines = []
-    lines.append(f"echo '  Patching pod5 metadata (flowcell={flowcell}, kit={kit}, sample_rate={sample_rate})...'")
-    # Use a here-document for the Python script to avoid quoting issues
-    lines.append(f"python3 << 'PATCH_EOF'")
-    lines.append("import shutil, sys")
+    lines.append(f"echo {_sh_quote(f'  Patching pod5 metadata ({summary})...')}")
+    # Quoted here-document: bash performs no expansion inside it.  Values are
+    # embedded with repr() so arbitrary paths/codes are valid Python literals.
+    lines.append("python3 << 'PATCH_EOF'")
+    lines.append("import dataclasses, os, sys")
     lines.append("from pathlib import Path")
     lines.append("try:")
     lines.append("    import pod5")
     lines.append("except ImportError:")
     lines.append("    print('Warning: pod5 Python package not installed, skipping metadata patch')")
     lines.append("    sys.exit(0)")
-    lines.append(f"pod5_dir = Path('{pod5_dir}')")
+    lines.append(f"pod5_dir = Path({pod5_dir!r})")
+    lines.append(f"updates = {updates!r}")
     lines.append("files = sorted(pod5_dir.rglob('*.pod5'))")
     lines.append("if not files:")
     lines.append("    print('  No pod5 files found to patch')")
     lines.append("    sys.exit(0)")
-    lines.append(f"print(f'  Patching {{len(files)}} pod5 file(s)...')")
+    lines.append("print(f'  Patching {len(files)} pod5 file(s)...')")
+    lines.append("failed = 0")
     lines.append("for p5 in files:")
-    lines.append("    tmp = p5.with_suffix('.pod5.tmp')")
+    lines.append("    tmp = p5.with_name(p5.name + '.tmp')")
+    lines.append("    patched = {}")
     lines.append("    try:")
-    lines.append("        with pod5.Reader(p5) as reader:")
-    lines.append("            with pod5.Writer(tmp) as writer:")
-    lines.append("                for record in reader.reads():")
-    lines.append("                    read = record.to_read()")
-    if flowcell:
-        lines.append(f"                    read.run_info.flow_cell_product_code = '{flowcell}'")
-    if kit:
-        lines.append(f"                    read.run_info.sequencing_kit = '{kit}'")
-    if sample_rate:
-        lines.append(f"                    read.run_info.sample_rate = {sample_rate}")
-    lines.append("                    writer.add_read(read)")
-    lines.append("        shutil.move(str(tmp), str(p5))")
+    lines.append("        if tmp.exists():")
+    lines.append("            tmp.unlink()")
+    lines.append("        with pod5.Reader(p5) as reader, pod5.Writer(tmp) as writer:")
+    lines.append("            for record in reader.reads():")
+    lines.append("                read = record.to_read()")
+    lines.append("                key = read.run_info.acquisition_id")
+    lines.append("                if key not in patched:")
+    lines.append("                    patched[key] = dataclasses.replace(read.run_info, **updates)")
+    lines.append("                read.run_info = patched[key]")
+    lines.append("                writer.add_read(read)")
+    lines.append("        os.replace(tmp, p5)")
     lines.append("        print(f'  Patched: {p5.name}')")
     lines.append("    except Exception as e:")
+    lines.append("        failed += 1")
     lines.append("        print(f'  Warning: failed to patch {p5.name}: {e}')")
     lines.append("        if tmp.exists():")
     lines.append("            tmp.unlink()")
+    lines.append("if failed:")
+    lines.append("    print(f'  Warning: {failed} pod5 file(s) could not be patched')")
     lines.append("PATCH_EOF")
     return lines
 
@@ -1168,7 +1246,11 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str |
     For runs where chemistry was detected from the source fast5, a
     post-conversion metadata patching step is included to inject the
     correct flowcell, kit, and sample_rate into the pod5 RunInfo.
+
+    All paths are shell-quoted.  Runs whose data exists only as compressed
+    archives are listed as comments (they must be extracted first).
     """
+    q = _sh_quote
     lines = [
         "#!/usr/bin/env bash",
         "# Auto-generated nanopore format conversion script",
@@ -1182,15 +1264,30 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str |
             if fmt == target_format:
                 continue  # Already in target format
 
+            detail = info["details"].get(fmt, {})
+            run_path = info.get("run_path", "")
+            if fmt in ("single_read_fast5", "multi_read_fast5") and (
+                detail.get("archive_files") or not run_path
+            ):
+                archives = detail.get("archive_files") or [run_name]
+                lines.append(f"# SKIPPED {run_name}: data is in compressed archive(s) "
+                             f"({', '.join(archives)}).")
+                lines.append("#   Extract first, then re-run the format checker, or use "
+                             "nanopore_converter.py which handles archives directly.")
+                lines.append("")
+                continue
+
             if target_format == "pod5" and fmt == "multi_read_fast5":
-                run_path = info.get("run_path", "")
                 if output_dir:
                     out = os.path.join(output_dir, run_name, "pod5")
+                elif "pod5" in info["formats"]:
+                    # Do not mix converted output with an existing pod5/ folder
+                    out = os.path.join(run_path, "pod5_from_fast5")
                 else:
                     out = os.path.join(run_path, "pod5")
-                lines.append(f"echo 'Converting {run_name} ({fmt} -> pod5)...'")
-                lines.append(f"mkdir -p '{out}'")
-                lines.append(f"pod5 convert fast5 '{run_path}/' --output '{out}/' --threads 20 --recursive")
+                lines.append(f"echo {q(f'Converting {run_name} ({fmt} -> pod5)...')}")
+                lines.append(f"mkdir -p {q(out)}")
+                lines.append(f"pod5 convert fast5 {q(run_path + '/')} --output {q(out + '/')} --threads 20 --recursive")
                 # Patch metadata if chemistry was detected from source fast5
                 chem = info.get("chemistry")
                 if chem:
@@ -1198,35 +1295,39 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str |
                 lines.append("")
 
             elif target_format == "pod5" and fmt == "single_read_fast5":
-                run_path = info.get("run_path", "")
                 if output_dir:
                     base = os.path.join(output_dir, run_name)
                 else:
                     base = run_path
                 multi_tmp = os.path.join(base, "multi_fast5_tmp")
-                out = os.path.join(base, "pod5")
-                lines.append(f"echo 'Converting {run_name} ({fmt} -> pod5, two steps)...'")
-                lines.append(f"mkdir -p '{multi_tmp}'")
-                lines.append(f"single_to_multi_fast5 -i '{run_path}' -s '{multi_tmp}' -t 4 --recursive")
-                lines.append(f"mkdir -p '{out}'")
-                lines.append(f"pod5 convert fast5 '{multi_tmp}/' --output '{out}/' --threads 20 --recursive")
+                if not output_dir and "pod5" in info["formats"]:
+                    out = os.path.join(base, "pod5_from_fast5")
+                else:
+                    out = os.path.join(base, "pod5")
+                lines.append(f"echo {q(f'Converting {run_name} ({fmt} -> pod5, two steps)...')}")
+                lines.append(f"mkdir -p {q(multi_tmp)}")
+                lines.append(f"single_to_multi_fast5 -i {q(run_path)} -s {q(multi_tmp)} -t 4 --recursive")
+                lines.append(f"mkdir -p {q(out)}")
+                lines.append(f"pod5 convert fast5 {q(multi_tmp + '/')} --output {q(out + '/')} --threads 20 --recursive")
                 # Patch metadata if chemistry was detected from source fast5
                 chem = info.get("chemistry")
                 if chem:
                     lines.extend(_pod5_metadata_fix_lines(out, chem))
-                lines.append(f"# intermediate multi-read fast5 kept in '{multi_tmp}' -- remove manually if no longer needed")
+                lines.append(f"# intermediate multi-read fast5 kept in {q(multi_tmp)} -- remove manually if no longer needed")
                 lines.append("")
 
             elif target_format == "single_fast5" and fmt == "multi_read_fast5":
-                dirs = info["details"].get(fmt, {}).get("directories", [])
+                dirs = detail.get("directories", [])
                 for d in dirs:
                     if output_dir:
                         out = os.path.join(output_dir, run_name, "single_fast5")
+                        if len(dirs) > 1:
+                            out = os.path.join(out, os.path.basename(d))
                     else:
                         out = os.path.join(os.path.dirname(d), "single_fast5")
-                    lines.append(f"echo 'Converting {run_name} ({fmt} -> single_fast5)...'")
-                    lines.append(f"mkdir -p '{out}'")
-                    lines.append(f"multi_to_single_fast5 --input_path '{d}' --save_path '{out}'")
+                    lines.append(f"echo {q(f'Converting {run_name} ({fmt} -> single_fast5)...')}")
+                    lines.append(f"mkdir -p {q(out)}")
+                    lines.append(f"multi_to_single_fast5 --input_path {q(d)} --save_path {q(out)} --recursive")
                     lines.append("")
 
     return "\n".join(lines)
@@ -1344,10 +1445,9 @@ def main():
     )
 
     # Find compressed archives in target folder — treat as single_read_fast5 runs
-    archive_exts = (".tar", ".gz", ".tar.gz", ".tgz")
     archive_files = sorted(
         [f for f in target.iterdir()
-         if f.is_file() and any(f.name.endswith(ext) for ext in archive_exts)
+         if f.is_file() and is_raw_archive(f.name)
          and is_nanopore_run_dir(f.name)]
     )
 

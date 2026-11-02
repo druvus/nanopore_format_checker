@@ -9,6 +9,14 @@ import unittest.mock as mock
 import zipfile as _zipfile
 from pathlib import Path
 
+
+def _emulate_tool(cmd):
+    """Mimic the side effect of single_to_multi_fast5 (writes into -s DIR)."""
+    if cmd and cmd[0] == "single_to_multi_fast5":
+        save = Path(cmd[cmd.index("-s") + 1])
+        save.mkdir(parents=True, exist_ok=True)
+        (save / "batch_0.fast5").write_bytes(b"x" * 10)
+
 def test_help_flag():
     """Script should print help and exit 0."""
     result = subprocess.run(
@@ -168,6 +176,7 @@ def test_convert_run_multi_read(tmp_path, monkeypatch):
     calls = []
     def mock_run(cmd, **kwargs):
         calls.append(cmd)
+        _emulate_tool(cmd)
         result = mock.Mock()
         result.returncode = 0
         return result
@@ -192,6 +201,7 @@ def test_convert_run_single_read(tmp_path, monkeypatch):
     calls = []
     def mock_run(cmd, **kwargs):
         calls.append(cmd)
+        _emulate_tool(cmd)
         result = mock.Mock()
         result.returncode = 0
         return result
@@ -217,7 +227,7 @@ def test_process_item_directory(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(
         "nanopore_converter.convert_run",
-        lambda *a, **kw: calls.append(("convert_run", a, kw))
+        lambda *a, **kw: calls.append(("convert_run", a, kw)) or True
     )
     d = tmp_path / "run1"
     d.mkdir()
@@ -232,7 +242,7 @@ def test_process_item_archive(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(
         "nanopore_converter.convert_run",
-        lambda *a, **kw: calls.append(("convert_run", a, kw))
+        lambda *a, **kw: calls.append(("convert_run", a, kw)) or True
     )
     # Create a tar.gz with a fake fast5
     src = tmp_path / "data"
@@ -266,6 +276,7 @@ def test_full_pipeline_dry_run(tmp_path, monkeypatch):
 
     # Mock subprocess.run and shutil.which
     def mock_run(cmd, **kwargs):
+        _emulate_tool(cmd)
         result = mock.Mock()
         result.returncode = 0
         return result
@@ -275,3 +286,85 @@ def test_full_pipeline_dry_run(tmp_path, monkeypatch):
     from nanopore_converter import main
     rc = main([str(listf), "--output-dir", str(output)])
     assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression tests from the code audit
+# ---------------------------------------------------------------------------
+
+def test_classify_small_multi_read_by_structure(tmp_path):
+    """A <1 MB multi-read fast5 must be detected as multi_read via HDF5."""
+    import pytest
+    h5py = pytest.importorskip("h5py")
+    from nanopore_converter import classify_fast5_dir
+    d = tmp_path / "fast5_fail"
+    d.mkdir()
+    with h5py.File(d / "batch_0.fast5", "w") as f:
+        f.attrs["file_type"] = "multi-read"
+        f.create_group("read_00000000-0000-0000-0000-000000000000")
+    assert (d / "batch_0.fast5").stat().st_size < 1_000_000
+    assert classify_fast5_dir(str(d)) == "multi_read_fast5"
+
+
+def test_single_to_multi_without_output_fails(tmp_path, monkeypatch):
+    """If single_to_multi_fast5 writes nothing, the run must fail."""
+    import pytest
+    from nanopore_converter import convert_run
+
+    def mock_run(cmd, **kwargs):  # exits 0 but writes nothing
+        result = mock.Mock()
+        result.returncode = 0
+        result.stderr = "Cannot input MultiRead files to single_to_multi"
+        return result
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    input_dir = tmp_path / "run1"
+    input_dir.mkdir()
+    (input_dir / "read.fast5").write_bytes(b"x" * 500)
+    with pytest.raises(subprocess.CalledProcessError):
+        convert_run(str(input_dir), str(tmp_path / "out"))
+
+
+def test_archive_output_named_after_archive(tmp_path, monkeypatch):
+    """Archives with files at the top level must not produce temp-dir names."""
+    from nanopore_converter import process_item
+    calls = []
+    monkeypatch.setattr(
+        "nanopore_converter.convert_run",
+        lambda *a, **kw: calls.append(kw) or True,
+    )
+    archive = tmp_path / "20240101_run.tar.gz"
+    src = tmp_path / "a.fast5"
+    src.write_bytes(b"x" * 500)
+    src2 = tmp_path / "b.fast5"
+    src2.write_bytes(b"x" * 500)
+    with _tarfile.open(archive, "w:gz") as tar:
+        tar.add(src, arcname="a.fast5")
+        tar.add(src2, arcname="b.fast5")
+    assert process_item(str(archive), str(tmp_path / "out")) is True
+    assert calls[0]["run_name"] == "20240101_run"
+
+
+def test_process_item_no_fast5_is_failure(tmp_path):
+    """A directory without fast5 files is reported as a failure."""
+    from nanopore_converter import process_item
+    d = tmp_path / "empty_run"
+    d.mkdir()
+    assert process_item(str(d), str(tmp_path / "out")) is False
+
+
+def test_extract_rejects_path_traversal(tmp_path):
+    """Tar members escaping the extraction dir must be rejected."""
+    import io
+    import pytest
+    from nanopore_converter import extract_archive
+    if not hasattr(_tarfile, "data_filter"):
+        pytest.skip("tarfile extraction filters unavailable")
+    archive = tmp_path / "evil.tar.gz"
+    with _tarfile.open(archive, "w:gz") as tar:
+        info = _tarfile.TarInfo("../escaped.fast5")
+        info.size = 3
+        tar.addfile(info, io.BytesIO(b"abc"))
+    with pytest.raises(_tarfile.TarError):
+        extract_archive(str(archive))
+    assert not (Path(_tarfile.__file__).parent / "escaped.fast5").exists()

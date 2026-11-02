@@ -85,9 +85,9 @@ python nanopore_converter.py /path/to/input --output-dir /scratch/converted --th
 ```
 
 The converter auto-detects the input type and fast5 format:
-- **single_read_fast5** (files < 1 MB): runs `single_to_multi_fast5` then `pod5 convert fast5`, cleans up intermediate files
-- **multi_read_fast5** (files >= 1 MB): runs `pod5 convert fast5` directly
-- **Compressed archives**: extracted to a temp directory, converted, then cleaned up
+- **single_read_fast5**: runs `single_to_multi_fast5` then `pod5 convert fast5`, cleans up intermediate files (fails the item if the merge step produces no output)
+- **multi_read_fast5**: runs `pod5 convert fast5` directly
+- **Compressed archives** (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tar`, `.zip`): safely extracted to a temp directory, converted, then cleaned up; output is named after the archive
 
 Output is written to `<output-dir>/<input_name>/pod5/`.
 
@@ -117,9 +117,9 @@ The tool identifies run directories by the `YYYYMMDD_` naming convention and sea
 - **pod5**: `pod5/`, `pod5_pass/`, `pod5_fail/` directories
 - **fast5**: `fast5/`, `fast5_pass/`, `fast5_fail/` directories, or `.fast5` files in the run root or numeric subdirectories
 - **fastq**: `fastq_pass/`, `fastq_fail/` directories
-- **Archives**: `.tar.gz`, `.tgz`, `.tar`, `.gz` files (treated as single-read fast5)
+- **Archives**: `.tar.gz`, `.tgz`, `.tar`, `.gz` files (treated as single-read fast5) -- only when no pod5/fast5 data was found; gzipped text/sequence outputs such as `sequencing_summary.txt.gz` or `*.fastq.gz` are ignored
 
-Fast5 files are classified as single-read (<1 MB) or multi-read (>=1 MB) based on file size. Barcoded layouts (e.g., `fast5_pass/barcode01/`) are handled automatically.
+Fast5 files are classified by inspecting the HDF5 root group of one sampled file (`read_*` groups = multi-read; `Raw/`/`UniqueGlobalKey/` = single-read). If h5py is unavailable or the file cannot be parsed, a size heuristic is used (<1 MB single-read, >=1 MB multi-read). Barcoded layouts (e.g., `fast5_pass/barcode01/`) are handled automatically.
 
 ## Chemistry detection
 
@@ -150,10 +150,10 @@ Generated scripts handle:
 ## Tests
 
 ```bash
-# Format checker tests (75 tests)
+# Format checker tests (80 tests)
 python test_optimizations.py
 
-# Converter tests (22 tests)
+# Converter tests (27 tests)
 python -m pytest test_nanopore_converter.py -v
 ```
 
