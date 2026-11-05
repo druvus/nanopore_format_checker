@@ -10,7 +10,7 @@ Standalone Python CLI tools for Oxford Nanopore sequencing data:
 
 - **`nanopore_converter.py`** -- Converts fast5 files to pod5 format. Accepts a folder, compressed archive (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tar`, `.zip`), or a text file listing paths (one per line, mixed folders and archives). Handles the two-step single_read_fast5 conversion automatically (`single_to_multi_fast5` then `pod5 convert fast5`). Calls conversion tools as subprocesses.
 
-- **`compress_folders.py`** -- Archives each subfolder of an input directory into its own `.tar.gz` (copies existing archives, recompresses plain `.tar`), in parallel, with atomic writes and skip-if-exists re-runs. `_add_tree()` walks the tree itself instead of `tarfile.add()` so an unreadable file or subfolder is skipped and counted rather than failing the whole archive; an unlistable top-level folder is an error (an empty archive would be skipped forever on re-runs).
+- **`compress_folders.py`** -- Archives each subfolder of an input directory into its own `.tar.gz` (copies existing archives, recompresses plain `.tar`), in parallel, with atomic writes and skip-if-exists re-runs. `_add_tree()` walks the tree itself instead of `tarfile.add()` so an unreadable file or subfolder is skipped and counted rather than failing the whole archive; an unlistable or untraversable top-level folder is an error (an empty archive would be skipped forever on re-runs). A top-level symlink is archived as its target's content; items sharing a destination archive are errors; the output dir is never archived into itself; Ctrl-C cancels queued items (`_STOP`); a hard link to a skipped file is stored as a regular file.
 
 ## Running
 
@@ -36,9 +36,10 @@ python nanopore_converter.py input_list.txt --output-dir /scratch/converted --th
 ### Tests
 
 ```bash
-python test_optimizations.py          # format checker tests (81 tests)
-python -m pytest test_nanopore_converter.py -v  # converter tests (36 tests)
-python -m pytest test_compress_folders.py -v    # archiver tests (5; one is skipped when run as root)
+python test_optimizations.py          # format checker tests (93 tests)
+python -m pytest test_nanopore_converter.py -v  # converter tests (46 tests)
+python -m pytest test_compress_folders.py -v    # archiver tests (12; two are skipped when run as root)
+python -m pytest test_integration.py -v         # real pod5/single_to_multi_fast5 end-to-end (5; skipped without the tools)
 ```
 
 ### Format checker CLI flags
@@ -70,6 +71,8 @@ Python 3.12 or newer is required; each script exits with an error on older versi
 pip install h5py ont_fast5_api pod5
 ```
 
+`ont_fast5_api` cannot be pip-installed normally on current Python (pinned `progressbar33` fails to build; it imports `pkg_resources`, gone from setuptools 81+): `pip install progressbar2 packaging "setuptools<81" && pip install --no-deps ont_fast5_api` (CI does this).
+
 `h5py` is the only hard dependency for the format checker (fast5 inspection). `pod5` is optional for the checker (needed for pod5 chemistry extraction and metadata patching). The converter requires `ont_fast5_api` (provides `single_to_multi_fast5` CLI) and `pod5` (provides `pod5 convert fast5` CLI) to be installed and on PATH.
 
 ## Architecture
@@ -81,11 +84,12 @@ Single script with no module structure. Key functions:
 - `is_nanopore_run_dir()` - Identifies run directories by the `YYYYMMDD_` naming convention
 - `discover_run_structure()` - Single-pass directory walk that categorizes all format-related subdirectories (pod5, fast5, fastq variants)
 - `analyze_run()` - Core function that classifies a single run directory. Detection priority: pod5 dirs -> fast5 dirs -> fast5 in root/numeric subdirs -> compressed archives -> unknown
-- `classify_fast5()` / `classify_fast5_by_structure()` / `classify_fast5_by_size()` - Distinguishes single vs multi-read fast5 by reading the HDF5 root group of one file (`read_*` groups = multi-read); falls back to a 1 MB size threshold when h5py is missing or the file is unparseable
+- `find_fast5_samples()` / `classify_fast5_samples()` - Collect up to 5 sample files (files before subfolders, up to 4 levels, symlinks followed with a loop guard, entry budget) and classify from the first one h5py can parse; size fallback only if none parses
+- `classify_fast5()` / `classify_fast5_by_structure()` / `classify_fast5_by_size()` - Single-file classification by HDF5 root group (`read_*` groups = multi-read), 1 MB size threshold as fallback
 - `is_raw_archive()` - Decides whether a file is a raw-data archive (`.tar`, `.tar.gz`, `.tgz`, `.gz`), excluding gzipped text/sequence outputs like `sequencing_summary.txt.gz`
 - `fast_count_files()` / `estimate_dir_size()` - Uses `os.scandir` for performance with large directories (100k+ single-read fast5 files); sampling-based size estimation for very large directories
 - `diagnose_unknown()` - Gathers diagnostic info when a run matches no known format
-- `generate_conversion_script()` - Emits bash scripts using `pod5 convert` or `ont_fast5_api` tools; includes post-conversion metadata patching when chemistry was detected from source files
+- `generate_conversion_script()` / `_pod5_conversion_lines()` / `_guarded_block()` - Emit re-runnable bash: per run, skip if output holds .pod5; otherwise work in `<base>/.convert_tmp`, convert only the detected fast5 folders, verify read counts (`_verify_read_count_lines`), patch metadata, move into place. Each run is a fail-fast subshell whose status is checked on its own line (`( ... ) ||` would disable `set -e` inside); failures are collected and the script exits 1 at the end. In-place output is always `<run>/pod5_from_fast5`
 - `write_stats_tsv()` - Writes per-run statistics to a TSV file (one row per format per run), including `dorado_version`, `dorado_model` and `dorado_note`
 - `extract_chemistry()` / `extract_chemistry_fast5()` / `extract_chemistry_pod5()` - Multi-fallback chemistry extraction from data files (one file per run)
 - `classify_chemistry()` - Maps flowcell/kit/sample-rate to pore type, dorado version (`None` when no dorado release supports it), model hint and explicit legacy model name (`DORADO_LEGACY_MODELS`)
@@ -118,11 +122,13 @@ Single script that orchestrates format conversion via subprocess calls. Key func
 - `extract_archive()` - Extracts compressed archives to a temp directory (tar uses the `data` extraction filter to block path traversal); caller handles cleanup
 - `parse_list_file()` - Reads a text file of paths (one per line, skips blanks and `#` comments)
 - `resolve_inputs()` - Resolves the input argument to a flat list of paths to process
-- `classify_fast5_dir()` - Walks a directory, samples one `.fast5` file, classifies by HDF5 layout with the 1 MB size threshold as fallback (same approach as the format checker)
-- `convert_run()` - Core conversion: for single_read_fast5, runs `single_to_multi_fast5` then `pod5 convert fast5`; for multi_read_fast5, runs `pod5 convert fast5` directly. Raises if `single_to_multi_fast5` writes no output (it exits 0 even when every file fails). Writes into `<run>/.pod5_partial/` and swaps it into `<run>/pod5/` only on success (old output is renamed aside, then deleted); clears leftovers from interrupted runs; always removes the intermediate `_multi_fast5_tmp/`
+- `scan_fast5_dir()` - Opens every `.fast5` with h5py and groups it as single-read, multi-read (with read count) or unreadable; `expected_reads` drives verification. `classify_fast5_dir()` summarises it (`mixed_fast5` possible)
+- `_run()` - Runs a tool in its own process group, logs problem lines from stderr at WARNING even on exit 0, kills the whole group on interrupt
+- `convert_run()` - Core conversion: stages single-read files (symlinks) for `single_to_multi_fast5` and multi-read files for `pod5 convert fast5` (a run may contain both), then `_verify_read_count()` requires the pod5 output to hold exactly `expected_reads` (raises `ConversionError`). Unreadable files are skipped and reported (`SKIPPED_UNREADABLE`, repeated in the summary). Writes `pod5/.source`. Writes into `<run>/.pod5_partial/` and swaps it into `<run>/pod5/` only on success (old output is renamed aside, then deleted); clears leftovers from interrupted runs; always removes the intermediate `_multi_fast5_tmp/`
 - `fill_missing_pod5_metadata()` - After conversion, fills empty `flow_cell_product_code` / `sequencing_kit` / `sample_rate` in pod5 RunInfo from the source fast5 (via the checker's `extract_chemistry_fast5`); never overwrites, never fails the conversion
 - `get_output_name()` - Derives output folder name from the resolved input path, stripping archive extensions
-- `is_converted()` - True if `<output-dir>/<name>/pod5/` already holds `.pod5` files; `main()` skips such inputs unless `--force`, and fails duplicate output names within one invocation
+- `is_converted()` / `converted_source()` / `_overlap_problem()` - `main()` skips converted inputs unless `--force`, refuses output converted from a different source (`pod5/.source`), refuses output on top of the input, dedupes resolved inputs, and fails duplicate output names within one invocation. SIGTERM is turned into `SystemExit` so cleanup runs
+- `parse_list_file()` resolves relative entries against the list file's folder and expands `~`
 - `process_item()` - Orchestrates one input item (directory or archive) with try/except/finally cleanup of temp directories
 - `main()` - Entry point: parses args, checks tools, resolves inputs, iterates over items, tracks success/failure counts
 
@@ -144,6 +150,10 @@ Output structure: `<output-dir>/<input_basename>/pod5/*.pod5`. A `pod5/` folder 
 ## Conventions
 
 - Permission errors are handled gracefully at every level; inaccessible directories are reported rather than causing failures
+- Never trust a conversion tool's exit code alone: `pod5 convert` and `single_to_multi_fast5` exit 0 after skipping files they cannot handle. Verify read counts (converter: `_verify_read_count`; scripts: embedded check)
+- `pod5 convert --output DIR/` writes a *file* named DIR if the folder does not exist; always create the output folder first
+- Hidden folders (starting with `.`) are work folders and never run data
+- Tests must not depend on `os.scandir` order; `test_optimizations.py`'s runner gives each test its own directory
 - File counting uses `os.scandir` instead of `Path.rglob` for performance on large directories
 - The 1 MB threshold for single vs multi-read fast5 classification is only a fallback heuristic (single-read: typically 1-50 KB; multi-read: typically 1+ MB, but small multi-read files exist, e.g. in `fast5_fail/`)
 - `pod5.RunInfo` is a frozen dataclass: metadata patching must use `dataclasses.replace()`, not attribute assignment
