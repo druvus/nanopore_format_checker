@@ -148,14 +148,20 @@ NON_RAW_GZ_SUFFIXES = (
 )
 
 
+# Archive suffixes the converter can extract (longest first, for stripping)
+RAW_ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz",
+                        ".tar", ".zip")
+
+
 def is_raw_archive(filename: str) -> bool:
     """Return True if a filename looks like a compressed raw-data archive.
 
-    Accepts .tar, .tar.gz, .tgz and plain .gz files, but rejects gzipped
-    text/sequence outputs such as sequencing_summary.txt.gz or reads.fastq.gz.
+    Accepts tar archives (plain, gzip, bzip2, xz), .zip and plain .gz files,
+    but rejects gzipped text/sequence outputs such as sequencing_summary.txt.gz
+    or reads.fastq.gz.
     """
     name = filename.lower()
-    if name.endswith((".tar", ".tar.gz", ".tgz")):
+    if name.endswith(RAW_ARCHIVE_SUFFIXES):
         return True
     if name.endswith(".gz"):
         return not name.endswith(NON_RAW_GZ_SUFFIXES)
@@ -230,15 +236,30 @@ def discover_run_structure(run_path: Path, max_depth: int = 5) -> dict[str, list
         "fastq_prefix": [],
     }
 
+    # Symlinked folders are followed (data is often linked in from other
+    # storage); real paths already visited are skipped to avoid loops.
+    visited = {os.path.realpath(run_path)}
+
     def _walk(directory: str, depth: int) -> None:
         if depth > max_depth:
             return
         try:
             with os.scandir(directory) as it:
                 for entry in it:
-                    if not entry.is_dir(follow_symlinks=False):
+                    try:
+                        if not entry.is_dir():
+                            continue
+                    except OSError:
                         continue
                     name = entry.name
+                    if name.startswith("."):
+                        # Hidden work folders (.convert_tmp, .pod5_partial) hold
+                        # incomplete conversions, not run data
+                        continue
+                    real = os.path.realpath(entry.path)
+                    if real in visited:
+                        continue
+                    visited.add(real)
                     path = Path(entry.path)
                     matched = False
                     if name == "pod5":
@@ -434,6 +455,73 @@ def classify_fast5_by_structure(fast5_file: Path) -> str | None:
     except Exception:
         return None
     return None
+
+
+def find_fast5_samples(directories: list[Path], limit: int = 5, max_depth: int = 4,
+                       max_entries: int = 50_000) -> list[Path]:
+    """Find up to `limit` .fast5 files under the given directories.
+
+    Files in a directory are taken before descending, so a 100k-file
+    single-read folder costs only a few entries.  Sub-folders are searched
+    up to max_depth levels (barcode01/0/, pass/0/, ...), symlinked folders
+    are followed with a loop guard, and at most max_entries directory
+    entries are examined in total.
+    """
+    samples: list[Path] = []
+    visited: set[str] = set()
+    budget = max_entries
+
+    def _search(path: str, depth: int) -> None:
+        nonlocal budget
+        real = os.path.realpath(path)
+        if depth > max_depth or real in visited or budget <= 0:
+            return
+        visited.add(real)
+        subdirs = []
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    budget -= 1
+                    if budget <= 0 or len(samples) >= limit:
+                        break
+                    try:
+                        if entry.is_file() and entry.name.lower().endswith(".fast5"):
+                            samples.append(Path(entry.path))
+                        elif entry.is_dir():
+                            subdirs.append(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            return
+        for sub in sorted(subdirs):
+            if len(samples) >= limit:
+                return
+            _search(sub, depth + 1)
+
+    for d in directories:
+        if len(samples) >= limit:
+            break
+        _search(str(d), 1)
+    return samples
+
+
+def classify_fast5_samples(samples: list[Path]) -> tuple[str, Path | None]:
+    """Classify a run from several sample files.
+
+    Uses the first sample whose HDF5 layout can be read, so one truncated or
+    corrupt file (common after a MinKNOW crash) does not decide the whole
+    run.  Only if no sample can be parsed (or h5py is missing) does the size
+    heuristic apply.  Returns (classification, sample used).
+    """
+    for sample in samples:
+        by_structure = classify_fast5_by_structure(sample)
+        if by_structure:
+            return by_structure, sample
+    for sample in samples:
+        by_size = classify_fast5_by_size(sample)
+        if by_size != "fast5_unknown":
+            return by_size, sample
+    return "fast5_unknown", (samples[0] if samples else None)
 
 
 def classify_fast5(fast5_file: Path) -> str:
@@ -909,38 +997,12 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
     if all_fast5_dirs:
         unreadable_fast5 = [str(d) for d in all_fast5_dirs if not _is_dir_readable(d)]
 
-        # Sample a fast5 file using os.scandir — also peek into subdirs (numeric 0/1/..., barcode01/, etc.)
-        sample_file = None
-        has_subdirs = False
-        for d in all_fast5_dirs:
-            if str(d) in unreadable_fast5:
-                continue
-            try:
-                subdirs = []
-                with os.scandir(d) as it:
-                    for entry in it:
-                        if entry.is_file(follow_symlinks=False) and entry.name.endswith(".fast5"):
-                            sample_file = Path(entry.path)
-                            break
-                        elif entry.is_dir(follow_symlinks=False):
-                            has_subdirs = True
-                            subdirs.append(entry.path)
-                if sample_file is None:
-                    for subdir in subdirs:
-                        try:
-                            with os.scandir(subdir) as sub_it:
-                                for sub_entry in sub_it:
-                                    if sub_entry.is_file(follow_symlinks=False) and sub_entry.name.endswith(".fast5"):
-                                        sample_file = Path(sub_entry.path)
-                                        break
-                        except PermissionError:
-                            pass
-                        if sample_file is not None:
-                            break
-            except PermissionError:
-                pass
-            if sample_file is not None:
-                break
+        # Sample a few fast5 files (descending into barcode/numeric subfolders)
+        readable_fast5_dirs = [d for d in all_fast5_dirs if str(d) not in unreadable_fast5]
+        samples = find_fast5_samples(readable_fast5_dirs)
+        classification, sample_file = classify_fast5_samples(samples)
+        fast5_dir_set = {str(d) for d in all_fast5_dirs}
+        has_subdirs = any(str(p.parent) not in fast5_dir_set for p in samples)
 
         variant_names = sorted(set(d.name for d in all_fast5_dirs))
         fast5_info = {
@@ -951,7 +1013,6 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
             fast5_info["inaccessible_dirs"] = unreadable_fast5
 
         if sample_file:
-            classification = classify_fast5(sample_file)
             fast5_info["sampled_file"] = sample_file.name
 
             if classification == "single_read_fast5":
@@ -1029,57 +1090,46 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
     # Only check if we didn't already find fast5 via a fast5/ subfolder
     # Uses os.scandir for speed — single_fast5 dirs can have 100k+ files
     if not all_fast5_dirs:
-        sample_file = None
-        classification = None
-        has_numeric_dirs = False
-        fast5_in_root = False
-
+        root_files = []
+        numeric_dirs = []
         try:
             with os.scandir(run_path) as it:
                 for entry in it:
-                    # Check for .fast5 file in root (just need one for classification)
-                    if not sample_file and entry.is_file(follow_symlinks=False) and entry.name.endswith(".fast5"):
-                        sample_file = Path(entry.path)
-                        classification = classify_fast5(sample_file)
-                        fast5_in_root = True
-                    # Check for numeric subdirectory
-                    elif not has_numeric_dirs and entry.is_dir(follow_symlinks=False) and re.match(r"^\d+$", entry.name):
-                        has_numeric_dirs = True
-                        # Try to find and classify a .fast5 inside this numeric dir
-                        if not sample_file:
-                            try:
-                                with os.scandir(entry.path) as sub_it:
-                                    for sub_entry in sub_it:
-                                        if sub_entry.is_file(follow_symlinks=False) and sub_entry.name.endswith(".fast5"):
-                                            sample_file = Path(sub_entry.path)
-                                            classification = classify_fast5(sample_file)
-                                            break
-                            except PermissionError:
-                                pass
-                    # Stop early once we have what we need
-                    if sample_file:
-                        break
+                    try:
+                        if entry.is_file() and entry.name.lower().endswith(".fast5"):
+                            if len(root_files) < 5:
+                                root_files.append(Path(entry.path))
+                        elif entry.is_dir() and re.match(r"^\d+$", entry.name):
+                            numeric_dirs.append(Path(entry.path))
+                    except OSError:
+                        continue
         except PermissionError:
             pass
+        # Every numeric folder is a candidate, not just the first one listed
+        samples = root_files or find_fast5_samples(sorted(numeric_dirs), max_depth=2)
+        classification, sample_file = classify_fast5_samples(samples)
 
-        if sample_file and classification:
+        if sample_file:
             fast5_info = {
-                "sampled_file": sample_file.name if isinstance(sample_file, Path) else sample_file,
-                "layout": "root" if fast5_in_root else "numeric_subdirs",
-                "size_based_classification": True,
+                "directories": [str(run_path)],
+                "sampled_file": sample_file.name,
+                "layout": "root" if root_files else "numeric_subdirs",
             }
-            if not quick and classification == "single_read_fast5":
-                count, size, is_estimated = estimate_dir_size(
-                    run_path, ".fast5", recursive=True
-                )
+            if not quick:
+                if classification == "multi_read_fast5":
+                    count, size = fast_count_files(run_path, ".fast5", recursive=True)
+                    is_estimated = False
+                else:
+                    count, size, is_estimated = estimate_dir_size(
+                        run_path, ".fast5", recursive=True
+                    )
                 fast5_info["file_count"] = count
                 fast5_info["data_size_bytes"] = size
                 if is_estimated:
                     fast5_info["size_estimated"] = True
 
-            if sample_file and classification and result["chemistry"] is None:
-                sample_path = sample_file if isinstance(sample_file, Path) else run_path / sample_file
-                chem = extract_chemistry(sample_path, "fast5")
+            if result["chemistry"] is None:
+                chem = extract_chemistry(sample_file, "fast5")
                 if chem:
                     result["chemistry"] = chem
                     result["chemistry_classification"] = classify_chemistry(chem)
@@ -1167,9 +1217,14 @@ def diagnose_unknown(run_path: Path) -> dict:
                 if entry_count >= MAX_DIAG_ENTRIES:
                     truncated = True
                     break
-                if entry.is_dir(follow_symlinks=False):
+                try:
+                    is_dir = entry.is_dir()
+                    is_file = not is_dir and entry.is_file()
+                except OSError:
+                    is_dir = is_file = False
+                if is_dir:
                     subdirs.append(entry.name)
-                elif entry.is_file(follow_symlinks=False):
+                elif is_file:
                     file_count += 1
                     dot_pos = entry.name.rfind(".")
                     ext = entry.name[dot_pos:].lower() if dot_pos >= 0 else "(no extension)"
@@ -1302,12 +1357,23 @@ def _pod5_metadata_fix_lines(pod5_dir: str, chemistry: dict) -> list[str]:
     lines.append("if not files:")
     lines.append("    print('  No pod5 files found to patch')")
     lines.append("    sys.exit(0)")
-    lines.append("print(f'  Patching {len(files)} pod5 file(s)...')")
+    lines.append("def matches(info):")
+    lines.append("    for k, v in updates.items():")
+    lines.append("        cur = getattr(info, k)")
+    lines.append("        if (str(cur).upper() != str(v).upper()) if isinstance(v, str) else cur != v:")
+    lines.append("            return False")
+    lines.append("    return True")
     lines.append("failed = 0")
     lines.append("for p5 in files:")
     lines.append("    tmp = p5.with_name(p5.name + '.tmp')")
     lines.append("    patched = {}")
     lines.append("    try:")
+    lines.append("        # Skip files that already carry these values (case-insensitive,")
+    lines.append("        # as dorado compares them): rewriting a large pod5 is expensive.")
+    lines.append("        with pod5.Reader(p5) as reader:")
+    lines.append("            if all(matches(r.run_info) for r in reader.reads()):")
+    lines.append("                print(f'  Already correct: {p5.name}')")
+    lines.append("                continue")
     lines.append("        if tmp.exists():")
     lines.append("            tmp.unlink()")
     lines.append("        with pod5.Reader(p5) as reader, pod5.Writer(tmp) as writer:")
@@ -1331,6 +1397,135 @@ def _pod5_metadata_fix_lines(pod5_dir: str, chemistry: dict) -> list[str]:
     return lines
 
 
+def _verify_read_count_lines(inputs: list[str], pod5_dir: str, exclude: str) -> list[str]:
+    """Bash lines that fail the script unless pod5_dir holds every read found
+    in the fast5 files under `inputs` (ignoring the `exclude` work folder).
+
+    pod5 convert and single_to_multi_fast5 exit 0 after skipping files they
+    cannot read (mixed single/multi-read runs, truncated files), so without
+    this check reads would be lost silently.
+    """
+    return [
+        "python3 - << 'VERIFY_EOF'",
+        "import os, sys",
+        "from pathlib import Path",
+        "try:",
+        "    import h5py, pod5",
+        "except ImportError:",
+        "    print('  Warning: h5py/pod5 Python packages missing; read count not verified')",
+        "    sys.exit(0)",
+        f"inputs = {inputs!r}",
+        f"exclude = os.path.realpath({exclude!r})",
+        "expected = unreadable = 0",
+        "for top in inputs:",
+        "    for root, dirs, files in os.walk(top):",
+        "        dirs[:] = [d for d in dirs if os.path.realpath(os.path.join(root, d)) != exclude]",
+        "        for name in files:",
+        "            if not name.lower().endswith('.fast5'):",
+        "                continue",
+        "            try:",
+        "                with h5py.File(os.path.join(root, name), 'r') as f:",
+        "                    n = sum(1 for k in f if k.startswith('read_'))",
+        "                    expected += n if n else (1 if ('Raw' in f or 'UniqueGlobalKey' in f) else 0)",
+        "            except Exception:",
+        "                unreadable += 1",
+        f"got = sum(pod5.Reader(p).num_reads for p in Path({pod5_dir!r}).rglob('*.pod5'))",
+        "if unreadable:",
+        "    print(f'  Warning: {unreadable} unreadable fast5 file(s) skipped')",
+        "if got != expected:",
+        "    print(f'  ERROR: pod5 output has {got} reads but the fast5 input has {expected}.')",
+        "    print('  Reads were lost (mixed single/multi-read files or corrupt files?).')",
+        "    print('  Convert this run with nanopore_converter.py, which handles both.')",
+        "    sys.exit(1)",
+        "print(f'  Verified {got} reads')",
+        "VERIFY_EOF",
+    ]
+
+
+def _guarded_block(run_name: str, body: list[str], cleanup: str | None = None) -> list[str]:
+    """Run body in a fail-fast subshell; a failure is recorded and the script
+    continues with the next run (exit status 1 at the end).
+
+    The subshell's status is checked on a separate line on purpose: inside
+    `( ... ) || ...` bash would silently disable `set -e`.
+    """
+    q = _sh_quote
+    lines = ["(", "  set -e"]
+    in_heredoc = False
+    for line in body:  # heredoc bodies must stay unindented
+        if in_heredoc:
+            lines.append(line)
+            if line in ("VERIFY_EOF", "PATCH_EOF"):
+                in_heredoc = False
+        else:
+            lines.append("  " + line)
+            if line.endswith(("<< 'VERIFY_EOF'", "<< 'PATCH_EOF'")):
+                in_heredoc = True
+    lines.append(")")
+    on_fail = f"rm -rf {q(cleanup)}; " if cleanup else ""
+    lines.append(f"if [ $? -ne 0 ]; then {on_fail}FAILED+=({q(run_name)}); "
+                 f"echo {q(f'FAILED: {run_name}')} >&2; fi")
+    return lines
+
+
+def _pod5_conversion_lines(run_name: str, info: dict, fmt: str, detail: dict,
+                           output_dir: str | None) -> list[str]:
+    """Re-runnable bash block converting one run's fast5 to pod5.
+
+    - Output: <output_dir>/<run>/pod5, or <run>/pod5_from_fast5 in place.  The
+      in-place name is fixed (not chosen by what exists) so re-checking a
+      converted run never schedules the same conversion again.
+    - Skipped when the output already holds .pod5 files, so a failed run can
+      be fixed and the script simply re-run.
+    - Work happens in <base>/.convert_tmp and is moved into place only after
+      the read count is verified; the input is only the detected fast5
+      folders (or the run root for root/numeric-folder layouts).
+    """
+    q = _sh_quote
+    run_path = info.get("run_path", "")
+    inputs = detail.get("directories") or [run_path]
+    if output_dir:
+        base = os.path.join(output_dir, run_name)
+        out = os.path.join(base, "pod5")
+    else:
+        base = run_path
+        out = os.path.join(run_path, "pod5_from_fast5")
+    work = os.path.join(base, ".convert_tmp")
+    partial = os.path.join(work, "pod5")
+    multi_tmp = os.path.join(work, "multi_fast5")
+
+    lines = [f"# --- {run_name} ({fmt} -> pod5) ---"]
+    lines.append(f"if compgen -G {q(out)}'/*.pod5' > /dev/null; then")
+    lines.append(f"  echo {q(f'Skipping {run_name}: already converted in {out}')}")
+    lines.append("else")
+    steps = ", two steps" if fmt == "single_read_fast5" else ""
+    body = [f"echo {q(f'Converting {run_name} ({fmt} -> pod5{steps})...')}",
+            f"rm -rf {q(work)}",
+            f"mkdir -p {q(partial)}"]
+    if fmt == "single_read_fast5":
+        body.append(f"mkdir -p {q(multi_tmp)}")
+        for i, d in enumerate(inputs):
+            # Distinct filename prefix per input folder so batches don't collide
+            body.append(f"single_to_multi_fast5 -i {q(d)} -s {q(multi_tmp)} -f batch{i} -t 4 --recursive")
+        pod5_inputs = [multi_tmp + "/"]
+    else:
+        pod5_inputs = [d.rstrip("/") + "/" for d in inputs]
+    body.append("pod5 convert fast5 " + " ".join(q(i) for i in pod5_inputs)
+                + f" --output {q(partial + '/')} --threads 20 --recursive")
+    body.extend(_verify_read_count_lines(inputs, partial, work))
+    chem = info.get("chemistry")
+    if chem:
+        body.extend(_pod5_metadata_fix_lines(partial, chem))
+    body.append(f"mkdir -p {q(os.path.dirname(out))}")
+    body.append(f"if [ -d {q(out)} ]; then rmdir {q(out)}; fi  # empty leftover (non-empty: fail)")
+    body.append(f"mv {q(partial)} {q(out)}")
+    body.append(f"rm -rf {q(work)}")
+    lines.extend(_guarded_block(run_name, body, cleanup=work))
+    lines.append("fi")
+    lines.append("")
+    return lines
+
+
 def generate_conversion_script(runs: dict, target_format: str, output_dir: str | None = None):
     """Generate a bash conversion script.
 
@@ -1349,7 +1544,11 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str |
         "#!/usr/bin/env bash",
         "# Auto-generated nanopore format conversion script",
         f"# Target format: {target_format}",
-        "set -euo pipefail",
+        "# Safe to re-run: runs whose output already holds .pod5 files are skipped.",
+        "# Each run executes fail-fast in its own subshell; a failed run is",
+        "# reported and the script continues, exiting 1 at the end.",
+        "set -uo pipefail",
+        "FAILED=()",
         "",
     ]
 
@@ -1371,60 +1570,37 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str |
                 lines.append("")
                 continue
 
-            if target_format == "pod5" and fmt == "multi_read_fast5":
-                if output_dir:
-                    out = os.path.join(output_dir, run_name, "pod5")
-                elif "pod5" in info["formats"]:
-                    # Do not mix converted output with an existing pod5/ folder
-                    out = os.path.join(run_path, "pod5_from_fast5")
-                else:
-                    out = os.path.join(run_path, "pod5")
-                lines.append(f"echo {q(f'Converting {run_name} ({fmt} -> pod5)...')}")
-                lines.append(f"mkdir -p {q(out)}")
-                lines.append(f"pod5 convert fast5 {q(run_path + '/')} --output {q(out + '/')} --threads 20 --recursive")
-                # Patch metadata if chemistry was detected from source fast5
-                chem = info.get("chemistry")
-                if chem:
-                    lines.extend(_pod5_metadata_fix_lines(out, chem))
-                lines.append("")
-
-            elif target_format == "pod5" and fmt == "single_read_fast5":
-                if output_dir:
-                    base = os.path.join(output_dir, run_name)
-                else:
-                    base = run_path
-                multi_tmp = os.path.join(base, "multi_fast5_tmp")
-                if not output_dir and "pod5" in info["formats"]:
-                    out = os.path.join(base, "pod5_from_fast5")
-                else:
-                    out = os.path.join(base, "pod5")
-                lines.append(f"echo {q(f'Converting {run_name} ({fmt} -> pod5, two steps)...')}")
-                lines.append(f"mkdir -p {q(multi_tmp)}")
-                lines.append(f"single_to_multi_fast5 -i {q(run_path)} -s {q(multi_tmp)} -t 4 --recursive")
-                lines.append(f"mkdir -p {q(out)}")
-                lines.append(f"pod5 convert fast5 {q(multi_tmp + '/')} --output {q(out + '/')} --threads 20 --recursive")
-                # Patch metadata if chemistry was detected from source fast5
-                chem = info.get("chemistry")
-                if chem:
-                    lines.extend(_pod5_metadata_fix_lines(out, chem))
-                lines.append(f"# intermediate multi-read fast5 kept in {q(multi_tmp)} -- remove manually if no longer needed")
-                lines.append("")
+            if target_format == "pod5" and fmt in ("multi_read_fast5", "single_read_fast5"):
+                lines.extend(_pod5_conversion_lines(run_name, info, fmt, detail, output_dir))
 
             elif target_format == "single_fast5" and fmt == "multi_read_fast5":
-                dirs = detail.get("directories", [])
+                dirs = detail.get("directories") or [run_path]
+                base = (os.path.join(output_dir, run_name, "single_fast5") if output_dir
+                        else os.path.join(run_path, "single_fast5"))
                 for d in dirs:
-                    if output_dir:
-                        out = os.path.join(output_dir, run_name, "single_fast5")
-                        if len(dirs) > 1:
-                            out = os.path.join(out, os.path.basename(d))
-                    else:
-                        out = os.path.join(os.path.dirname(d), "single_fast5")
-                    lines.append(f"echo {q(f'Converting {run_name} ({fmt} -> single_fast5)...')}")
-                    lines.append(f"mkdir -p {q(out)}")
-                    lines.append(f"multi_to_single_fast5 --input_path {q(d)} --save_path {q(out)} --recursive")
+                    # One output folder per input folder: fast5_pass and
+                    # fast5_fail are not mixed together.
+                    sub = "root" if os.path.normpath(d) == os.path.normpath(run_path) \
+                        else os.path.basename(os.path.normpath(d))
+                    out = os.path.join(base, sub)
+                    lines.extend(_guarded_block(f"{run_name}/{sub}", [
+                        f"echo {q(f'Converting {run_name} ({fmt} -> single_fast5): {sub}')}",
+                        f"mkdir -p {q(out)}",
+                        f"multi_to_single_fast5 --input_path {q(d)} --save_path {q(out)} --recursive",
+                    ]))
                     lines.append("")
 
+    lines.append('if [ ${#FAILED[@]} -gt 0 ]; then')
+    lines.append('  echo "${#FAILED[@]} run(s) failed: ${FAILED[*]}" >&2')
+    lines.append('  exit 1')
+    lines.append('fi')
+    lines.append('echo "All conversions finished."')
     return "\n".join(lines)
+
+
+def _tsv_field(value) -> str:
+    """Make a value safe for a TSV cell (tabs/newlines would split rows)."""
+    return re.sub(r"[\t\r\n]+", " ", str(value))
 
 
 def write_stats_tsv(all_runs: dict, output_path: str) -> None:
@@ -1482,7 +1658,7 @@ def write_stats_tsv(all_runs: dict, output_path: str) -> None:
                     chem_class.get("explicit_model", "") or "",
                     chem_class.get("note", "") or "",
                 ]
-                fh.write("\t".join(row) + "\n")
+                fh.write("\t".join(_tsv_field(v) for v in row) + "\n")
 
 
 def main():
@@ -1527,7 +1703,10 @@ def main():
     )
     args = parser.parse_args()
 
-    target = Path(args.target_folder)
+    # Absolute paths, so the generated script works from any directory
+    target = Path(args.target_folder).resolve()
+    if args.output_dir:
+        args.output_dir = os.path.abspath(args.output_dir)
     if not target.is_dir():
         print(f"Error: '{target}' is not a directory", file=sys.stderr)
         sys.exit(1)
@@ -1648,10 +1827,13 @@ def main():
     for archive in archive_files:
         # Strip archive extensions to get the run name
         name = archive.name
-        for ext in (".tar.gz", ".tgz", ".tar", ".gz"):
-            if name.endswith(ext):
+        for ext in RAW_ARCHIVE_SUFFIXES + (".gz",):
+            if name.lower().endswith(ext):
                 name = name[: -len(ext)]
                 break
+        if name in all_runs:
+            # A run folder of the same name exists: keep both entries
+            name = archive.name
 
         result = {
             "formats": ["single_read_fast5"],

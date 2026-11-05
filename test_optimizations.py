@@ -646,10 +646,10 @@ def test_generate_conversion_single_to_pod5(tmp_path: Path) -> None:
     script = generate_conversion_script(runs, "pod5")
     assert "single_to_multi_fast5" in script, "Should contain single_to_multi_fast5 step"
     assert "pod5 convert fast5" in script, "Should contain pod5 convert step"
-    assert "multi_fast5_tmp" in script, "Should use multi_fast5_tmp intermediate dir"
+    assert "/data/run/.convert_tmp/multi_fast5" in script, "Should use a work dir for intermediates"
     assert "--threads 20" in script, "Should use --threads 20"
     assert "two steps" in script, "Should mention two steps"
-    assert "single_to_multi_fast5 -i '/data/run'" in script, "Should use run folder for single_to_multi"
+    assert "single_to_multi_fast5 -i '/data/run/fast5'" in script, "Should convert the detected fast5 folder"
     # No chemistry -> no metadata patch
     assert "Patching pod5 metadata" not in script, "Should not patch without chemistry"
     print("  PASS: generate_conversion_script single_read_fast5 -> pod5")
@@ -672,7 +672,7 @@ def test_generate_conversion_multi_to_pod5(tmp_path: Path) -> None:
     assert "pod5 convert fast5" in script, "Should contain pod5 convert"
     assert "--threads 20" in script, "Should use --threads 20"
     assert "--recursive" in script, "Should use --recursive"
-    assert "pod5 convert fast5 '/data/run/'" in script, "Should use run folder as input"
+    assert "pod5 convert fast5 '/data/run/fast5/'" in script, "Should convert the detected fast5 folder"
     assert "single_to_multi_fast5" not in script, "Should NOT contain single_to_multi_fast5"
     print("  PASS: generate_conversion_script multi_read_fast5 -> pod5")
 
@@ -702,16 +702,17 @@ def test_generate_conversion_with_output_dir(tmp_path: Path) -> None:
     script = generate_conversion_script(runs, "pod5", output_dir="/scratch/converted")
     # Multi-read output should go to output_dir/run_name/pod5
     assert "/scratch/converted/20240101_run_multi/pod5" in script
-    # Input should be the run folder
-    assert "pod5 convert fast5 '/readonly/storage/20240101_run_multi/'" in script
-    # Single-read intermediate should go to output_dir/run_name/multi_fast5_tmp
-    assert "/scratch/converted/20240101_run_single/multi_fast5_tmp" in script
+    # Input should be the detected fast5 folder, not the whole run
+    assert "pod5 convert fast5 '/readonly/storage/20240101_run_multi/fast5/'" in script
+    # Single-read intermediates go to the output side, never the read-only input
+    assert "/scratch/converted/20240101_run_single/.convert_tmp/multi_fast5" in script
+    assert "/readonly/storage/20240101_run_single/.convert_tmp" not in script
     assert "/scratch/converted/20240101_run_single/pod5" in script
     print("  PASS: generate_conversion_script with --output-dir")
 
 
 def test_generate_conversion_without_output_dir(tmp_path: Path) -> None:
-    """Without --output-dir, output goes alongside originals in run folder."""
+    """Without --output-dir, output goes alongside originals in run/pod5_from_fast5."""
     runs = {
         "20240101_run_multi": {
             "formats": ["multi_read_fast5"],
@@ -724,8 +725,8 @@ def test_generate_conversion_without_output_dir(tmp_path: Path) -> None:
         },
     }
     script = generate_conversion_script(runs, "pod5")
-    assert "/data/20240101_run_multi/pod5" in script
-    assert "pod5 convert fast5 '/data/20240101_run_multi/'" in script
+    assert "mv '/data/20240101_run_multi/.convert_tmp/pod5' '/data/20240101_run_multi/pod5_from_fast5'" in script
+    assert "pod5 convert fast5 '/data/20240101_run_multi/fast5/'" in script
     print("  PASS: generate_conversion_script without --output-dir")
 
 
@@ -1431,6 +1432,187 @@ def test_metadata_patch_executes(tmp_path: Path) -> None:
     print("  PASS: metadata patch executes against real pod5")
 
 
+
+# ---------------------------------------------------------------------------
+# Audit round 2: sampling, archives, symlinks, TSV
+# ---------------------------------------------------------------------------
+
+def _make_single_read_fast5(path: Path) -> None:
+    import h5py
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as f:
+        f.create_group("Raw/Reads/Read_1")
+        f.create_group("UniqueGlobalKey/channel_id").attrs["sampling_rate"] = 4000.0
+
+
+def test_truncated_sample_does_not_decide_run(tmp_path: Path) -> None:
+    """A corrupt fast5 listed first must not make a multi-read run single-read."""
+    run = tmp_path / "20240101_run_truncated"
+    for name in ("aaa_truncated.fast5", "zzz_truncated.fast5"):
+        make_file(run / "fast5_pass" / name, size=4096)  # unparseable, <1 MB
+    _make_multi_read_fast5(run / "fast5_pass" / "batch_1.fast5")
+    result = analyze_run(run)
+    assert result["formats"] == ["multi_read_fast5"], result["formats"]
+    assert result["details"]["multi_read_fast5"]["sampled_file"] == "batch_1.fast5"
+    print("  PASS: truncated sample does not decide the run")
+
+
+def test_deeply_nested_and_numeric_layouts(tmp_path: Path) -> None:
+    """fast5/pass/0/*.fast5 and numeric dirs whose first entries are empty."""
+    run = tmp_path / "20240101_run_nested"
+    _make_single_read_fast5(run / "fast5" / "pass" / "0" / "r1.fast5")
+    assert analyze_run(run)["formats"] == ["single_read_fast5"]
+
+    run2 = tmp_path / "20240101_run_numeric_gaps"
+    for i in range(6):
+        (run2 / str(i)).mkdir(parents=True)
+    _make_single_read_fast5(run2 / "5" / "r1.fast5")
+    result = analyze_run(run2)
+    assert result["formats"] == ["single_read_fast5"], result["formats"]
+    assert result["details"]["single_read_fast5"]["layout"] == "numeric_subdirs"
+    print("  PASS: nested and numeric layouts")
+
+
+def test_symlinked_data_folder(tmp_path: Path) -> None:
+    store = tmp_path / "store" / "fast5_real"
+    _make_multi_read_fast5(store / "batch_0.fast5")
+    run = tmp_path / "20240101_run_symlink"
+    run.mkdir()
+    os.symlink(store, run / "fast5_pass")
+    os.symlink(run, run / "loop")  # must not recurse forever
+    assert analyze_run(run)["formats"] == ["multi_read_fast5"]
+    print("  PASS: symlinked data folder")
+
+
+def test_multi_read_in_root_has_size_and_directory(tmp_path: Path) -> None:
+    run = tmp_path / "20240101_run_multi_root"
+    _make_multi_read_fast5(run / "batch_0.fast5")
+    detail = analyze_run(run)["details"]["multi_read_fast5"]
+    assert detail["file_count"] == 1 and detail["data_size_bytes"] > 0
+    assert detail["directories"] == [str(run)]
+    print("  PASS: multi-read in run root")
+
+
+def test_more_archive_types(tmp_path: Path) -> None:
+    from nanopore_format_checker import is_raw_archive
+    for name in ("r.tar.bz2", "r.tbz2", "r.tar.xz", "r.zip"):
+        assert is_raw_archive(name), name
+    run = tmp_path / "20240101_run_zip"
+    make_file(run / "fast5.zip", size=100)
+    assert analyze_run(run)["formats"] == ["single_read_fast5"]
+    print("  PASS: bz2/xz/zip archives")
+
+
+def test_tsv_fields_with_tabs_and_newlines(tmp_path: Path) -> None:
+    runs = {"20240101_a\tb": {"formats": ["pod5"], "details": {"pod5": {
+        "directories": ["/x/line1\nline2"], "note": "n\tote"}}}}
+    out = tmp_path / "t.tsv"
+    write_stats_tsv(runs, str(out))
+    rows = out.read_text().splitlines()
+    assert len(rows) == 2
+    assert len({len(r.split("\t")) for r in rows}) == 1
+    print("  PASS: TSV escaping")
+
+
+def test_main_keeps_run_and_archive_with_same_name(tmp_path: Path) -> None:
+    """Regression: an archive replaced the folder run of the same name."""
+    import subprocess
+    target = tmp_path / "runs"
+    _make_multi_read_fast5(target / "20240101_dup" / "fast5_pass" / "batch_0.fast5")
+    make_file(target / "20240101_dup.tar.gz", size=100)
+    tsv = tmp_path / "s.tsv"
+    script = Path(__file__).parent / "nanopore_format_checker.py"
+    subprocess.run([sys.executable, str(script), str(target), "-o", str(tsv)],
+                   check=True, capture_output=True)
+    names = sorted((r.split("\t")[0], r.split("\t")[1]) for r in tsv.read_text().splitlines()[1:])
+    assert names == [("20240101_dup", "multi_read_fast5"),
+                     ("20240101_dup.tar.gz", "single_read_fast5")], names
+    print("  PASS: run and archive with the same name")
+
+
+
+# ---------------------------------------------------------------------------
+# Audit round 2: generated conversion scripts
+# ---------------------------------------------------------------------------
+
+def _script_for(tmp_path: Path, fmt: str = "multi_read_fast5", **kw) -> str:
+    run = str(tmp_path / "20240101_run")
+    runs = {"20240101_run": {
+        "formats": [fmt],
+        "details": {fmt: {"directories": [run + "/fast5_pass", run + "/fast5_fail"]}},
+        "run_path": run,
+        "chemistry": {"flowcell": "FLO-MIN106", "kit": "SQK-LSK109", "sample_rate": 4000},
+    }}
+    return generate_conversion_script(runs, "pod5", **kw)
+
+
+def test_script_is_rerunnable_and_isolates_failures(tmp_path: Path) -> None:
+    import subprocess
+    script = _script_for(tmp_path)
+    run = str(tmp_path / "20240101_run")
+    # Skips runs that are already converted
+    assert f"if compgen -G '{run}/pod5_from_fast5''/*.pod5' > /dev/null; then" in script
+    # Converts only the detected folders, into a work dir moved into place
+    assert f"pod5 convert fast5 '{run}/fast5_pass/' '{run}/fast5_fail/' --output '{run}/.convert_tmp/pod5/'" in script
+    assert f"mv '{run}/.convert_tmp/pod5' '{run}/pod5_from_fast5'" in script
+    # Read-count verification runs before the output is published
+    assert script.index("VERIFY_EOF") < script.index("mv '")
+    # No global errexit; each run is a fail-fast subshell checked separately
+    assert "set -euo pipefail" not in script and "set -uo pipefail" in script
+    assert "(\n  set -e" in script and ") ||" not in script
+    assert 'echo "${#FAILED[@]} run(s) failed' in script
+    check = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
+    assert check.returncode == 0, check.stderr
+    print("  PASS: script is re-runnable and isolates failures")
+
+
+def test_script_single_read_batches_per_input_folder(tmp_path: Path) -> None:
+    script = _script_for(tmp_path, "single_read_fast5", output_dir=str(tmp_path / "out"))
+    assert "-f batch0" in script and "-f batch1" in script
+    assert str(tmp_path / "out" / "20240101_run" / ".convert_tmp" / "multi_fast5") in script
+    print("  PASS: single-read batches per input folder")
+
+
+def test_failed_run_block_actually_continues(tmp_path: Path) -> None:
+    """Execute a generated script whose first run fails (tools missing):
+    the second run block must still run and the script must exit 1."""
+    import subprocess
+    runs = {}
+    for name in ("20240101_a", "20240101_b"):
+        run = tmp_path / name
+        (run / "fast5_pass").mkdir(parents=True)
+        runs[name] = {"formats": ["multi_read_fast5"], "run_path": str(run),
+                      "details": {"multi_read_fast5": {"directories": [str(run / "fast5_pass")]}}}
+    script = generate_conversion_script(runs, "pod5")
+    res = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                         env={"PATH": "/usr/bin:/bin"})  # no pod5 on PATH -> both fail
+    assert res.returncode == 1
+    assert "FAILED: 20240101_a" in res.stderr and "FAILED: 20240101_b" in res.stderr
+    assert "2 run(s) failed" in res.stderr
+    assert not any((tmp_path / n / ".convert_tmp").exists() for n in runs)  # cleaned up
+    print("  PASS: failed run does not stop the script")
+
+
+def test_single_fast5_outputs_per_input_folder(tmp_path: Path) -> None:
+    runs = {"20240101_run": {
+        "formats": ["multi_read_fast5"], "run_path": "/d/20240101_run",
+        "details": {"multi_read_fast5": {"directories": [
+            "/d/20240101_run/fast5_pass", "/d/20240101_run/fast5_fail"]}}}}
+    script = generate_conversion_script(runs, "single_fast5")
+    assert "--save_path '/d/20240101_run/single_fast5/fast5_pass'" in script
+    assert "--save_path '/d/20240101_run/single_fast5/fast5_fail'" in script
+    print("  PASS: single_fast5 output per input folder")
+
+
+def test_hidden_work_folders_are_not_run_data(tmp_path: Path) -> None:
+    run = tmp_path / "20240101_run_hidden"
+    _make_multi_read_fast5(run / "fast5_pass" / "batch_0.fast5")
+    make_file(run / ".convert_tmp" / "pod5" / "output.pod5", size=100)
+    make_file(run / ".pod5_partial" / "output.pod5", size=100)
+    assert analyze_run(run)["formats"] == ["multi_read_fast5"]
+    print("  PASS: hidden work folders ignored")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -1518,13 +1700,28 @@ def main():
         test_conversion_script_quoting_and_archives,
         test_metadata_patch_executes,
         test_classify_chemistry_dorado_matrix,
+        test_truncated_sample_does_not_decide_run,
+        test_deeply_nested_and_numeric_layouts,
+        test_symlinked_data_folder,
+        test_multi_read_in_root_has_size_and_directory,
+        test_more_archive_types,
+        test_tsv_fields_with_tabs_and_newlines,
+        test_main_keeps_run_and_archive_with_same_name,
+        test_script_is_rerunnable_and_isolates_failures,
+        test_script_single_read_batches_per_input_folder,
+        test_failed_run_block_actually_continues,
+        test_single_fast5_outputs_per_input_folder,
+        test_hidden_work_folders_are_not_run_data,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         for test_fn in tests:
             try:
-                test_fn(tmp_path)
+                # Each test gets its own directory, as under pytest
+                test_dir = tmp_path / test_fn.__name__
+                test_dir.mkdir()
+                test_fn(test_dir)
                 passed += 1
             except Exception as e:
                 print(f"  FAIL: {test_fn.__name__}: {e}")

@@ -127,3 +127,120 @@ def test_real_permissions(tmp_path):
     assert names["run/a/b"] == "d" and "run/a/b/two.txt" not in names
     assert "run/top.txt" not in names
     assert names["run/a/one.txt"] == "f"
+
+
+# ---------------------------------------------------------------------------
+# Audit round 2
+# ---------------------------------------------------------------------------
+
+def test_top_level_symlink_archives_its_content(tmp_path):
+    """Regression: a symlinked run folder was archived as a bare link."""
+    real = _tree(tmp_path / "store")
+    (tmp_path / "in").mkdir()
+    os.symlink(real, tmp_path / "in" / "linked")
+    _compress(tmp_path / "in" / "linked", tmp_path / "out")
+    names = dict(_members(tmp_path / "out" / "linked.tar.gz"))
+    assert names["linked"] == "d"
+    assert names["linked/a/b/two.txt"] == "f"
+
+
+def test_items_sharing_a_destination_are_errors(tmp_path):
+    """Regression: run1/ and run1.tar.gz both wrote out/run1.tar.gz."""
+    src = tmp_path / "in"
+    (src / "run1").mkdir(parents=True)
+    (src / "run1" / "a.txt").write_text("a")
+    (src / "run1.tar.gz").write_bytes(b"existing archive")
+    (src / "run2").mkdir()
+    errors = cf.process(src, tmp_path / "out", dry_run=False, workers=2)
+    assert errors == 2
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["run2.tar.gz"]
+
+
+def test_output_inside_input_is_not_archived(tmp_path):
+    src = tmp_path / "in"
+    (src / "runA").mkdir(parents=True)
+    (src / "runA" / "x.txt").write_text("x")
+    out = src / "archives"
+    assert cf.process(src, out, dry_run=False, workers=2) == 0
+    assert sorted(p.name for p in out.iterdir()) == ["runA.tar.gz"]
+
+
+def test_hardlink_to_skipped_file_is_stored_as_file(tmp_path, monkeypatch):
+    """Regression: the second link pointed at a member missing from the tar."""
+    src = tmp_path / "runH"
+    src.mkdir()
+    (src / "a.fast5").write_text("data")
+    os.link(src / "a.fast5", src / "b.fast5")
+    locked = str(src / "a.fast5")
+    calls = {"n": 0}
+
+    def fake_open(path, *args, **kwargs):
+        if str(path) == locked:
+            raise PermissionError(13, "Permission denied", path)
+        return open(path, *args, **kwargs)
+
+    monkeypatch.setattr(cf, "open", fake_open, raising=False)
+    _compress(src, tmp_path / "out")
+    archive = tmp_path / "out" / "runH.tar.gz"
+    assert dict(_members(archive)) == {"runH": "d", "runH/b.fast5": "f"}
+    with tarfile.open(archive) as tar:  # extracts without dangling hard links
+        tar.extractall(tmp_path / "x", filter="data")
+    assert (tmp_path / "x" / "runH" / "b.fast5").read_text() == "data"
+
+
+def test_untraversable_top_level_directory_is_an_error(tmp_path, monkeypatch):
+    """Regression: mode r-- (listable, not traversable) gave an empty archive."""
+    src = _tree(tmp_path)
+    real_lstat = os.lstat
+
+    def lstat(path, *a, **kw):
+        if os.path.dirname(str(path)) == str(src):
+            raise PermissionError(13, "Permission denied", path)
+        return real_lstat(path, *a, **kw)
+
+    monkeypatch.setattr(cf.os, "lstat", lstat)
+    out = tmp_path / "out"
+    progress = _compress(src, out)
+    assert progress.errors == 1 and list(out.iterdir()) == []
+
+
+def test_interrupt_cancels_queued_items(tmp_path, monkeypatch):
+    """Regression: Ctrl-C still ran every queued item to completion."""
+    import time
+    src = tmp_path / "in"
+    for i in range(6):
+        (src / f"run{i}").mkdir(parents=True)
+    started = []
+
+    def slow(srcdir, dest, dry_run, progress):
+        started.append(srcdir.name)
+        time.sleep(0.3)
+
+    monkeypatch.setattr(cf, "compress_directory", slow)
+
+    def interrupted(futures):
+        raise KeyboardInterrupt
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(cf, "as_completed", interrupted)
+    cf._STOP.clear()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            cf.process(src, tmp_path / "out", dry_run=False, workers=1)
+        assert cf._STOP.is_set()
+        assert len(started) < 6
+    finally:
+        cf._STOP.clear()
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root bypasses file permissions")
+def test_real_untraversable_top_level_directory(tmp_path):
+    src = _tree(tmp_path)
+    src.chmod(0o644)  # r-- for owner: listable, not traversable
+    try:
+        progress = _compress(src, tmp_path / "out")
+    finally:
+        src.chmod(0o755)
+    assert progress.errors == 1
+    assert not (tmp_path / "out" / "run.tar.gz").exists()

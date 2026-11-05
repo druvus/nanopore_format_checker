@@ -31,13 +31,20 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-test.txt
 
-      # The converter's external tools (single_to_multi_fast5, pod5 CLI) are
-      # mocked in the tests, so ont_fast5_api is not needed here.  h5py and
-      # pod5 are used to build and read real fast5/pod5 files.
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-test.txt
+
+      # Real conversion tools for test_integration.py.  ont_fast5_api's pinned
+      # progressbar33 no longer builds, and it imports pkg_resources (removed
+      # from setuptools 81), so install it without dependencies.
+      - name: Install conversion tools
+        run: |
+          python -m pip install progressbar2 packaging "setuptools<81"
+          python -m pip install --no-deps ont_fast5_api
+          single_to_multi_fast5 --help > /dev/null
+          pod5 --help > /dev/null
 
       - name: Byte-compile scripts
         run: python -m compileall -q nanopore_format_checker.py nanopore_converter.py compress_folders.py
@@ -49,4 +56,4 @@ jobs:
           python compress_folders.py --help > /dev/null
 
       - name: Run tests
-        run: python -m pytest test_optimizations.py test_nanopore_converter.py test_compress_folders.py -v
+        run: python -m pytest test_optimizations.py test_nanopore_converter.py test_compress_folders.py test_integration.py -v -rs

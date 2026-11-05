@@ -2,6 +2,7 @@
 """Tests for nanopore_converter.py"""
 
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile as _tarfile
@@ -9,13 +10,78 @@ import unittest.mock as mock
 import zipfile as _zipfile
 from pathlib import Path
 
+import pytest
 
-def _emulate_tool(cmd):
-    """Mimic the side effect of single_to_multi_fast5 (writes into -s DIR)."""
-    if cmd and cmd[0] == "single_to_multi_fast5":
-        save = Path(cmd[cmd.index("-s") + 1])
-        save.mkdir(parents=True, exist_ok=True)
-        (save / "batch_0.fast5").write_bytes(b"x" * 10)
+import nanopore_converter
+
+
+# ---------------------------------------------------------------------------
+# Minimal but structurally real fast5 files, and fake conversion tools that
+# keep honest read counts (so read-count verification is exercised).
+# ---------------------------------------------------------------------------
+
+def _single_fast5(path):
+    import h5py
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as f:
+        f.create_group("Raw/Reads/Read_1")
+        f.create_group("UniqueGlobalKey/tracking_id")
+    return path
+
+
+def _multi_fast5(path, n_reads=3):
+    import h5py
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as f:
+        f.attrs["file_type"] = "multi-read"
+        for i in range(n_reads):
+            f.create_group(f"read_{i:08d}-0000-0000-0000-{path.stem[:12]:0>12}")
+    return path
+
+
+def _reads_in(paths):
+    """Total reads in all fast5 files under the given dirs (follows symlinks)."""
+    import h5py
+    total = 0
+    for p in paths:
+        for f in Path(p).rglob("*.fast5"):
+            with h5py.File(f, "r") as h:
+                n = sum(1 for k in h if k.startswith("read_"))
+                total += n if n else 1
+    return total
+
+
+class FakeTools:
+    """Stand-in for nanopore_converter._run.
+
+    single_to_multi_fast5 writes one multi-read file holding one read per
+    input file; pod5 convert writes a real pod5 holding as many reads as its
+    inputs (minus `drop`), refusing to overwrite like the real tool.
+    """
+
+    def __init__(self, monkeypatch, fail_pod5=False, drop=0):
+        self.calls = []
+        self.fail_pod5 = fail_pod5
+        self.drop = drop
+        monkeypatch.setattr(nanopore_converter, "_run", self)
+        monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
+
+    def __call__(self, cmd, label):
+        self.calls.append(cmd)
+        if cmd[0] == "single_to_multi_fast5":
+            src = cmd[cmd.index("-i") + 1]
+            save = Path(cmd[cmd.index("-s") + 1])
+            _multi_fast5(save / "batch_0.fast5", _reads_in([src]))
+        elif cmd[0] == "pod5":
+            if self.fail_pod5:
+                raise subprocess.CalledProcessError(1, label)
+            out_idx = cmd.index("--output")
+            inputs = cmd[3:out_idx]
+            out = Path(cmd[out_idx + 1])
+            assert not (out / "output.pod5").exists(), "pod5 would refuse to overwrite"
+            _write_pod5(out / "output.pod5", n_reads=_reads_in(inputs) - self.drop)
+        return ""
+
 
 def test_help_flag():
     """Script should print help and exit 0."""
@@ -138,88 +204,66 @@ def test_resolve_inputs_listfile(tmp_path):
     assert len(inputs) == 2
 
 def test_classify_fast5_single(tmp_path):
-    """Small fast5 files should be classified as single_read."""
     from nanopore_converter import classify_fast5_dir
-    d = tmp_path / "fast5"
-    d.mkdir()
-    # Single-read fast5: < 1MB
-    (d / "read1.fast5").write_bytes(b"x" * 500)
-    assert classify_fast5_dir(str(d)) == "single_read_fast5"
+    _single_fast5(tmp_path / "fast5" / "read1.fast5")
+    assert classify_fast5_dir(str(tmp_path / "fast5")) == "single_read_fast5"
+
 
 def test_classify_fast5_multi(tmp_path):
-    """Large fast5 files should be classified as multi_read."""
     from nanopore_converter import classify_fast5_dir
-    d = tmp_path / "fast5"
-    d.mkdir()
-    # Multi-read fast5: >= 1MB
-    (d / "batch0.fast5").write_bytes(b"x" * 2_000_000)
-    assert classify_fast5_dir(str(d)) == "multi_read_fast5"
+    _multi_fast5(tmp_path / "fast5" / "batch0.fast5")
+    assert classify_fast5_dir(str(tmp_path / "fast5")) == "multi_read_fast5"
+
+
+def test_classify_fast5_mixed(tmp_path):
+    from nanopore_converter import classify_fast5_dir
+    _single_fast5(tmp_path / "run" / "fast5_pass" / "r.fast5")
+    _multi_fast5(tmp_path / "run" / "fast5_fail" / "b.fast5")
+    assert classify_fast5_dir(str(tmp_path / "run")) == "mixed_fast5"
+
 
 def test_classify_fast5_empty(tmp_path):
-    """Empty directory should return None."""
     from nanopore_converter import classify_fast5_dir
-    d = tmp_path / "empty"
-    d.mkdir()
-    assert classify_fast5_dir(str(d)) is None
+    (tmp_path / "empty").mkdir()
+    assert classify_fast5_dir(str(tmp_path / "empty")) is None
+
 
 def test_classify_fast5_nested(tmp_path):
-    """Should find fast5 in nested subdirectories."""
     from nanopore_converter import classify_fast5_dir
-    d = tmp_path / "run" / "fast5_pass" / "barcode01"
-    d.mkdir(parents=True)
-    (d / "read1.fast5").write_bytes(b"x" * 500)
+    _single_fast5(tmp_path / "run" / "fast5_pass" / "barcode01" / "0" / "read1.fast5")
     assert classify_fast5_dir(str(tmp_path / "run")) == "single_read_fast5"
+
+
+def test_scan_counts_reads_and_flags_unreadable(tmp_path):
+    from nanopore_converter import scan_fast5_dir
+    run = tmp_path / "run"
+    _single_fast5(run / "a" / "r1.fast5")
+    _single_fast5(run / "a" / "r2.fast5")
+    _multi_fast5(run / "b" / "m.fast5", 7)
+    (run / "b" / "truncated.fast5").write_bytes(b"\x89HDF\r\n\x1a\n" + b"x" * 100)
+    scan = scan_fast5_dir(str(run))
+    assert len(scan.single) == 2 and len(scan.multi) == 1
+    assert [p.name for p in scan.unreadable] == ["truncated.fast5"]
+    assert scan.expected_reads == 9
+
 
 def test_convert_run_multi_read(tmp_path, monkeypatch):
     """Multi-read fast5 should call pod5 convert directly."""
     from nanopore_converter import convert_run
-    calls = []
-    def mock_run(cmd, **kwargs):
-        calls.append(cmd)
-        _emulate_tool(cmd)
-        result = mock.Mock()
-        result.returncode = 0
-        return result
-    monkeypatch.setattr(subprocess, "run", mock_run)
+    tools = FakeTools(monkeypatch)
+    _multi_fast5(tmp_path / "run1" / "batch.fast5")
+    assert convert_run(str(tmp_path / "run1"), str(tmp_path / "output")) is True
+    assert [c[0] for c in tools.calls] == ["pod5"]
 
-    input_dir = tmp_path / "run1"
-    input_dir.mkdir()
-    (input_dir / "batch.fast5").write_bytes(b"x" * 2_000_000)
-
-    output_dir = tmp_path / "output"
-    output_dir.mkdir()
-
-    convert_run(str(input_dir), str(output_dir), threads=4)
-
-    # Should have called pod5 convert fast5 once
-    assert len(calls) == 1
-    assert "pod5" in calls[0][0]
 
 def test_convert_run_single_read(tmp_path, monkeypatch):
     """Single-read fast5 should call single_to_multi_fast5 then pod5 convert."""
     from nanopore_converter import convert_run
-    calls = []
-    def mock_run(cmd, **kwargs):
-        calls.append(cmd)
-        _emulate_tool(cmd)
-        result = mock.Mock()
-        result.returncode = 0
-        return result
-    monkeypatch.setattr(subprocess, "run", mock_run)
+    tools = FakeTools(monkeypatch)
+    _single_fast5(tmp_path / "run1" / "read.fast5")
+    assert convert_run(str(tmp_path / "run1"), str(tmp_path / "output")) is True
+    assert [c[0] for c in tools.calls] == ["single_to_multi_fast5", "pod5"]
 
-    input_dir = tmp_path / "run1"
-    input_dir.mkdir()
-    (input_dir / "read.fast5").write_bytes(b"x" * 500)
-
-    output_dir = tmp_path / "output"
-    output_dir.mkdir()
-
-    convert_run(str(input_dir), str(output_dir), threads=4)
-
-    # Should have called single_to_multi_fast5, then pod5 convert
-    assert len(calls) == 2
-    assert "single_to_multi_fast5" in calls[0][0]
-    assert "pod5" in calls[1][0]
 
 def test_process_item_directory(tmp_path, monkeypatch):
     """process_item should call convert_run for a directory."""
@@ -231,10 +275,9 @@ def test_process_item_directory(tmp_path, monkeypatch):
     )
     d = tmp_path / "run1"
     d.mkdir()
-    (d / "test.fast5").write_bytes(b"x" * 500)
-    result = process_item(str(d), str(tmp_path / "out"), threads=4)
-    assert result is True
+    assert process_item(str(d), str(tmp_path / "out"), threads=4) is True
     assert len(calls) == 1
+
 
 def test_process_item_archive(tmp_path, monkeypatch):
     """process_item should extract archive, convert, then cleanup."""
@@ -244,48 +287,30 @@ def test_process_item_archive(tmp_path, monkeypatch):
         "nanopore_converter.convert_run",
         lambda *a, **kw: calls.append(("convert_run", a, kw)) or True
     )
-    # Create a tar.gz with a fake fast5
-    src = tmp_path / "data"
-    src.mkdir()
-    (src / "test.fast5").write_bytes(b"x" * 500)
+    src = _single_fast5(tmp_path / "data" / "test.fast5")
     archive = tmp_path / "data.tar.gz"
     with _tarfile.open(archive, "w:gz") as tar:
-        tar.add(src / "test.fast5", arcname="data/test.fast5")
-    result = process_item(str(archive), str(tmp_path / "out"), threads=4)
-    assert result is True
+        tar.add(src, arcname="data/test.fast5")
+    assert process_item(str(archive), str(tmp_path / "out"), threads=4) is True
     assert len(calls) == 1
 
-def test_full_pipeline_dry_run(tmp_path, monkeypatch):
-    """End-to-end test with mocked subprocess calls."""
-    # Create a list file with a directory and an archive
-    run_dir = tmp_path / "run1"
-    run_dir.mkdir()
-    (run_dir / "reads.fast5").write_bytes(b"x" * 500)
 
+def test_full_pipeline_dry_run(tmp_path, monkeypatch):
+    """End-to-end with fake tools: a directory and an archive from a list."""
+    FakeTools(monkeypatch)
+    run_dir = tmp_path / "run1"
+    _single_fast5(run_dir / "reads.fast5")
     src2 = tmp_path / "run2"
-    src2.mkdir()
-    (src2 / "batch.fast5").write_bytes(b"x" * 2_000_000)
+    _multi_fast5(src2 / "batch.fast5")
     archive = tmp_path / "run2.tar.gz"
     with _tarfile.open(archive, "w:gz") as tar:
         tar.add(src2, arcname="run2")
-
     listf = tmp_path / "inputs.txt"
     listf.write_text(f"{run_dir}\n{archive}\n")
-
-    output = tmp_path / "output"
-
-    # Mock subprocess.run and shutil.which
-    def mock_run(cmd, **kwargs):
-        _emulate_tool(cmd)
-        result = mock.Mock()
-        result.returncode = 0
-        return result
-    monkeypatch.setattr(subprocess, "run", mock_run)
-    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
-
-    from nanopore_converter import main
-    rc = main([str(listf), "--output-dir", str(output)])
-    assert rc == 0
+    from nanopore_converter import main, count_pod5_reads
+    assert main([str(listf), "--output-dir", str(tmp_path / "output")]) == 0
+    assert count_pod5_reads(str(tmp_path / "output" / "run1" / "pod5")) == 1
+    assert count_pod5_reads(str(tmp_path / "output" / "run2" / "pod5")) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -306,23 +331,43 @@ def test_classify_small_multi_read_by_structure(tmp_path):
     assert classify_fast5_dir(str(d)) == "multi_read_fast5"
 
 
-def test_single_to_multi_without_output_fails(tmp_path, monkeypatch):
-    """If single_to_multi_fast5 writes nothing, the run must fail."""
-    import pytest
-    from nanopore_converter import convert_run
+def test_lost_reads_fail_the_run(tmp_path, monkeypatch):
+    """Both tools exit 0 after dropping files; the read count must catch it."""
+    from nanopore_converter import ConversionError, convert_run
+    FakeTools(monkeypatch, drop=1)
+    _single_fast5(tmp_path / "run1" / "a.fast5")
+    _single_fast5(tmp_path / "run1" / "b.fast5")
+    with pytest.raises(ConversionError, match="has 1 reads .* contain 2"):
+        convert_run(str(tmp_path / "run1"), str(tmp_path / "out"))
+    assert not (tmp_path / "out" / "run1" / "pod5").exists()
 
-    def mock_run(cmd, **kwargs):  # exits 0 but writes nothing
-        result = mock.Mock()
-        result.returncode = 0
-        result.stderr = "Cannot input MultiRead files to single_to_multi"
-        return result
-    monkeypatch.setattr(subprocess, "run", mock_run)
 
-    input_dir = tmp_path / "run1"
-    input_dir.mkdir()
-    (input_dir / "read.fast5").write_bytes(b"x" * 500)
-    with pytest.raises(subprocess.CalledProcessError):
-        convert_run(str(input_dir), str(tmp_path / "out"))
+def test_mixed_single_and_multi_converts_all_reads(tmp_path, monkeypatch):
+    """Regression: only the sampled kind used to be converted."""
+    from nanopore_converter import convert_run, count_pod5_reads
+    tools = FakeTools(monkeypatch)
+    run = tmp_path / "runA"
+    for i in range(4):
+        _single_fast5(run / "fast5_pass" / f"r{i}.fast5")
+    _multi_fast5(run / "fast5_fail" / "batch.fast5", 5)
+    assert convert_run(str(run), str(tmp_path / "out")) is True
+    assert [c[0] for c in tools.calls] == ["single_to_multi_fast5", "pod5"]
+    assert count_pod5_reads(str(tmp_path / "out" / "runA" / "pod5")) == 9
+
+
+def test_corrupt_file_is_skipped_and_reported(tmp_path, monkeypatch):
+    """Regression: a truncated first file used to turn a run into 0 reads."""
+    from nanopore_converter import convert_run, count_pod5_reads
+    nanopore_converter.SKIPPED_UNREADABLE.clear()
+    FakeTools(monkeypatch)
+    run = tmp_path / "runM"
+    (run / "fast5_pass").mkdir(parents=True)
+    (run / "fast5_pass" / "aaa_truncated.fast5").write_bytes(b"\x89HDF" + b"x" * 50)
+    _multi_fast5(run / "fast5_pass" / "batch_1.fast5", 6)
+    assert convert_run(str(run), str(tmp_path / "out")) is True
+    assert count_pod5_reads(str(tmp_path / "out" / "runM" / "pod5")) == 6
+    assert [p.name for p in nanopore_converter.SKIPPED_UNREADABLE] == ["aaa_truncated.fast5"]
+    nanopore_converter.SKIPPED_UNREADABLE.clear()
 
 
 def test_archive_output_named_after_archive(tmp_path, monkeypatch):
@@ -372,52 +417,34 @@ def test_extract_rejects_path_traversal(tmp_path):
 # Re-running into an existing output directory
 # ---------------------------------------------------------------------------
 
-def _fake_tools(monkeypatch, calls, fail_pod5=False):
-    """Mock subprocess.run: single_to_multi writes a batch, pod5 writes output.pod5."""
-    def mock_run(cmd, **kwargs):
-        calls.append(cmd)
-        _emulate_tool(cmd)
-        result = mock.Mock()
-        result.returncode = 0
-        result.stderr = ""
-        if cmd[0] == "pod5":
-            if fail_pod5:
-                result.returncode = 1
-                return result
-            out = Path(cmd[cmd.index("--output") + 1])
-            # Mimic pod5's refusal to overwrite an existing file
-            assert not (out / "output.pod5").exists(), "pod5 would refuse to overwrite"
-            (out / "output.pod5").write_bytes(b"new")
-        return result
-    monkeypatch.setattr(subprocess, "run", mock_run)
-    monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
-
-
 def _make_run(tmp_path, name="run1"):
     d = tmp_path / name
-    d.mkdir()
-    (d / "reads.fast5").write_bytes(b"x" * 2_000_000)  # multi-read by size
+    _multi_fast5(d / "reads.fast5")
     return d
+
+
+def _pod5_reads(path):
+    import pod5
+    with pod5.Reader(path) as r:
+        return r.num_reads
 
 
 def test_rerun_skips_converted_input(tmp_path, monkeypatch):
     from nanopore_converter import main
-    calls = []
-    _fake_tools(monkeypatch, calls)
+    tools = FakeTools(monkeypatch)
     run = _make_run(tmp_path)
     out = tmp_path / "out"
     assert main([str(run), "--output-dir", str(out)]) == 0
-    assert len(calls) == 1
-    assert (out / "run1" / "pod5" / "output.pod5").read_bytes() == b"new"
+    assert len(tools.calls) == 1
+    assert _pod5_reads(out / "run1" / "pod5" / "output.pod5") == 3
     # Second run: nothing is converted, exit code still 0
     assert main([str(run), "--output-dir", str(out)]) == 0
-    assert len(calls) == 1
+    assert len(tools.calls) == 1
 
 
 def test_rerun_skips_archive_without_extracting(tmp_path, monkeypatch):
     from nanopore_converter import main
-    calls = []
-    _fake_tools(monkeypatch, calls)
+    tools = FakeTools(monkeypatch)
     src = _make_run(tmp_path, "20240101_run")
     archive = tmp_path / "20240101_run.tar.gz"
     with _tarfile.open(archive, "w:gz") as tar:
@@ -429,26 +456,24 @@ def test_rerun_skips_archive_without_extracting(tmp_path, monkeypatch):
     monkeypatch.setattr("nanopore_converter.extract_archive",
                         lambda p: extracted.append(p) or str(tmp_path))
     assert main([str(archive), "--output-dir", str(out)]) == 0
-    assert extracted == [] and calls == []
+    assert extracted == [] and tools.calls == []
 
 
 def test_force_replaces_existing_output(tmp_path, monkeypatch):
     from nanopore_converter import main
-    calls = []
-    _fake_tools(monkeypatch, calls)
+    FakeTools(monkeypatch)
     run = _make_run(tmp_path)
     pod5_dir = tmp_path / "out" / "run1" / "pod5"
     pod5_dir.mkdir(parents=True)
     (pod5_dir / "output.pod5").write_bytes(b"old")
     assert main([str(run), "--output-dir", str(tmp_path / "out"), "--force"]) == 0
-    assert (pod5_dir / "output.pod5").read_bytes() == b"new"
+    assert _pod5_reads(pod5_dir / "output.pod5") == 3
     assert sorted(p.name for p in pod5_dir.parent.iterdir()) == ["pod5"]
 
 
 def test_force_keeps_old_output_when_conversion_fails(tmp_path, monkeypatch):
     from nanopore_converter import main
-    calls = []
-    _fake_tools(monkeypatch, calls, fail_pod5=True)
+    FakeTools(monkeypatch, fail_pod5=True)
     run = _make_run(tmp_path)
     pod5_dir = tmp_path / "out" / "run1" / "pod5"
     pod5_dir.mkdir(parents=True)
@@ -461,8 +486,7 @@ def test_force_keeps_old_output_when_conversion_fails(tmp_path, monkeypatch):
 def test_failed_conversion_leaves_no_pod5_dir(tmp_path, monkeypatch):
     """A failure must not create pod5/, or the next run would skip it as done."""
     from nanopore_converter import is_converted, main
-    calls = []
-    _fake_tools(monkeypatch, calls, fail_pod5=True)
+    FakeTools(monkeypatch, fail_pod5=True)
     run = _make_run(tmp_path)
     out = tmp_path / "out"
     assert main([str(run), "--output-dir", str(out)]) == 1
@@ -472,25 +496,23 @@ def test_failed_conversion_leaves_no_pod5_dir(tmp_path, monkeypatch):
 
 def test_leftovers_from_interrupted_run_are_cleared(tmp_path, monkeypatch):
     from nanopore_converter import convert_run
-    calls = []
-    _fake_tools(monkeypatch, calls)
+    FakeTools(monkeypatch)
     run = tmp_path / "run1"
-    run.mkdir()
-    (run / "read.fast5").write_bytes(b"x" * 500)  # single-read by size
+    _single_fast5(run / "read.fast5")
     out = tmp_path / "out"
     (out / "run1" / ".pod5_partial").mkdir(parents=True)
     (out / "run1" / ".pod5_partial" / "output.pod5").write_bytes(b"partial")
     (out / "run1" / "_multi_fast5_tmp").mkdir()
-    (out / "run1" / "_multi_fast5_tmp" / "stale.fast5").write_bytes(b"stale")
+    _multi_fast5(out / "run1" / "_multi_fast5_tmp" / "stale.fast5", 9)
+    (out / "run1" / "_fast5_stage").mkdir()
     assert convert_run(str(run), str(out)) is True
-    assert (out / "run1" / "pod5" / "output.pod5").read_bytes() == b"new"
+    assert _pod5_reads(out / "run1" / "pod5" / "output.pod5") == 1
     assert sorted(p.name for p in (out / "run1").iterdir()) == ["pod5"]
 
 
 def test_duplicate_output_names_in_one_invocation_fail(tmp_path, monkeypatch):
     from nanopore_converter import main
-    calls = []
-    _fake_tools(monkeypatch, calls)
+    tools = FakeTools(monkeypatch)
     (tmp_path / "a").mkdir()
     (tmp_path / "b").mkdir()
     a = _make_run(tmp_path / "a")  # a/run1
@@ -498,7 +520,100 @@ def test_duplicate_output_names_in_one_invocation_fail(tmp_path, monkeypatch):
     listf = tmp_path / "inputs.txt"
     listf.write_text(f"{a}\n{b}\n")
     assert main([str(listf), "--output-dir", str(tmp_path / "out")]) == 1
-    assert len(calls) == 1  # only the first one was converted
+    assert len(tools.calls) == 1  # only the first one was converted
+
+
+def test_same_name_from_different_source_is_refused(tmp_path, monkeypatch):
+    """Regression: run2/fast5_pass was skipped as run1/fast5_pass's output."""
+    from nanopore_converter import main
+    tools = FakeTools(monkeypatch)
+    one = _make_run(tmp_path / "run1", "fast5_pass")
+    two = _make_run(tmp_path / "run2", "fast5_pass")
+    out = str(tmp_path / "out")
+    assert main([str(one), "--output-dir", out]) == 0
+    for extra in ([], ["--force"]):
+        assert main([str(two), "--output-dir", out, *extra]) == 1
+    assert len(tools.calls) == 1
+    assert (tmp_path / "out" / "fast5_pass" / "pod5" / ".source").read_text().strip() \
+        == str(one.resolve())
+
+
+def test_output_overlapping_input_is_refused(tmp_path, monkeypatch):
+    """Regression: --output-dir <parent> --force deleted the run's own pod5/."""
+    from nanopore_converter import main
+    tools = FakeTools(monkeypatch)
+    run = _make_run(tmp_path / "runs", "runP")
+    (run / "pod5").mkdir()
+    (run / "pod5" / "original.pod5").write_bytes(b"original")
+    assert main([str(run), "--output-dir", str(tmp_path / "runs"), "--force"]) == 1
+    assert (run / "pod5" / "original.pod5").read_bytes() == b"original"
+    assert tools.calls == []
+
+
+def test_output_inside_input_is_not_rescanned(tmp_path, monkeypatch):
+    from nanopore_converter import main, count_pod5_reads
+    FakeTools(monkeypatch)
+    run = _make_run(tmp_path, "run1")
+    out = run / "converted"
+    assert main([str(run), "--output-dir", str(out)]) == 0
+    assert main([str(run), "--output-dir", str(out), "--force"]) == 0
+    assert count_pod5_reads(str(out / "run1" / "pod5")) == 3
+
+
+def test_list_file_paths_relative_to_list_and_deduplicated(tmp_path, monkeypatch):
+    from nanopore_converter import main, parse_list_file
+    tools = FakeTools(monkeypatch)
+    data = tmp_path / "data"
+    _make_run(data, "run1")
+    _make_run(data, "run2")
+    listf = data / "list.txt"
+    listf.write_bytes(b"run1\r\nrun2/\r\n./run2\r\n")
+    assert parse_list_file(str(listf)) == [str(data / "run1"), str(data / "run2/"),
+                                           str(data / "./run2")]
+    monkeypatch.chdir(tmp_path)  # run from elsewhere
+    assert main([str(listf), "--output-dir", str(tmp_path / "out")]) == 0
+    assert len(tools.calls) == 2
+
+
+def test_run_surfaces_tool_problems_and_failures(caplog):
+    from nanopore_converter import _run
+    with caplog.at_level("WARNING"):
+        _run(["sh", "-c", "echo 'progress 50%' >&2; echo 'ERROR: bad file x' >&2"], "tool")
+    assert "ERROR: bad file x" in caplog.text and "progress" not in caplog.text
+    with pytest.raises(subprocess.CalledProcessError):
+        _run(["sh", "-c", "exit 3"], "tool")
+
+
+def test_run_kills_tool_process_group_when_interrupted(tmp_path):
+    """Regression: SIGTERM left the conversion tools (and workers) running."""
+    import os
+    import time
+    from nanopore_converter import _run
+    pidfile = tmp_path / "pids"
+
+    class Interrupted(Exception):
+        pass
+
+    def on_alarm(signum, frame):
+        raise Interrupted
+    old = signal.signal(signal.SIGALRM, on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, 1.0)
+    try:
+        with pytest.raises(Interrupted):
+            # parent tool plus a background "worker" in the same group
+            _run(["sh", "-c", f"sleep 60 & echo $! > {pidfile}; sleep 60"], "tool")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+    worker = int(pidfile.read_text())
+    time.sleep(0.2)
+    # Dead means gone, or a zombie (killed but not yet reaped: in containers
+    # PID 1 may never reap orphans).
+    try:
+        state = Path(f"/proc/{worker}/stat").read_text().split()[2]
+    except FileNotFoundError:
+        state = "gone"
+    assert state in ("gone", "Z"), f"worker still running (state {state})"
 
 
 # ---------------------------------------------------------------------------
