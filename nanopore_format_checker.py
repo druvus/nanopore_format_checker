@@ -251,11 +251,15 @@ def discover_run_structure(run_path: Path, max_depth: int = 5) -> dict[str, list
                             continue
                     except OSError:
                         continue
+                    name = entry.name
+                    if name.startswith("."):
+                        # Hidden work folders (.convert_tmp, .pod5_partial) hold
+                        # incomplete conversions, not run data
+                        continue
                     real = os.path.realpath(entry.path)
                     if real in visited:
                         continue
                     visited.add(real)
-                    name = entry.name
                     path = Path(entry.path)
                     matched = False
                     if name == "pod5":
@@ -1353,12 +1357,23 @@ def _pod5_metadata_fix_lines(pod5_dir: str, chemistry: dict) -> list[str]:
     lines.append("if not files:")
     lines.append("    print('  No pod5 files found to patch')")
     lines.append("    sys.exit(0)")
-    lines.append("print(f'  Patching {len(files)} pod5 file(s)...')")
+    lines.append("def matches(info):")
+    lines.append("    for k, v in updates.items():")
+    lines.append("        cur = getattr(info, k)")
+    lines.append("        if (str(cur).upper() != str(v).upper()) if isinstance(v, str) else cur != v:")
+    lines.append("            return False")
+    lines.append("    return True")
     lines.append("failed = 0")
     lines.append("for p5 in files:")
     lines.append("    tmp = p5.with_name(p5.name + '.tmp')")
     lines.append("    patched = {}")
     lines.append("    try:")
+    lines.append("        # Skip files that already carry these values (case-insensitive,")
+    lines.append("        # as dorado compares them): rewriting a large pod5 is expensive.")
+    lines.append("        with pod5.Reader(p5) as reader:")
+    lines.append("            if all(matches(r.run_info) for r in reader.reads()):")
+    lines.append("                print(f'  Already correct: {p5.name}')")
+    lines.append("                continue")
     lines.append("        if tmp.exists():")
     lines.append("            tmp.unlink()")
     lines.append("        with pod5.Reader(p5) as reader, pod5.Writer(tmp) as writer:")
@@ -1382,6 +1397,135 @@ def _pod5_metadata_fix_lines(pod5_dir: str, chemistry: dict) -> list[str]:
     return lines
 
 
+def _verify_read_count_lines(inputs: list[str], pod5_dir: str, exclude: str) -> list[str]:
+    """Bash lines that fail the script unless pod5_dir holds every read found
+    in the fast5 files under `inputs` (ignoring the `exclude` work folder).
+
+    pod5 convert and single_to_multi_fast5 exit 0 after skipping files they
+    cannot read (mixed single/multi-read runs, truncated files), so without
+    this check reads would be lost silently.
+    """
+    return [
+        "python3 - << 'VERIFY_EOF'",
+        "import os, sys",
+        "from pathlib import Path",
+        "try:",
+        "    import h5py, pod5",
+        "except ImportError:",
+        "    print('  Warning: h5py/pod5 Python packages missing; read count not verified')",
+        "    sys.exit(0)",
+        f"inputs = {inputs!r}",
+        f"exclude = os.path.realpath({exclude!r})",
+        "expected = unreadable = 0",
+        "for top in inputs:",
+        "    for root, dirs, files in os.walk(top):",
+        "        dirs[:] = [d for d in dirs if os.path.realpath(os.path.join(root, d)) != exclude]",
+        "        for name in files:",
+        "            if not name.lower().endswith('.fast5'):",
+        "                continue",
+        "            try:",
+        "                with h5py.File(os.path.join(root, name), 'r') as f:",
+        "                    n = sum(1 for k in f if k.startswith('read_'))",
+        "                    expected += n if n else (1 if ('Raw' in f or 'UniqueGlobalKey' in f) else 0)",
+        "            except Exception:",
+        "                unreadable += 1",
+        f"got = sum(pod5.Reader(p).num_reads for p in Path({pod5_dir!r}).rglob('*.pod5'))",
+        "if unreadable:",
+        "    print(f'  Warning: {unreadable} unreadable fast5 file(s) skipped')",
+        "if got != expected:",
+        "    print(f'  ERROR: pod5 output has {got} reads but the fast5 input has {expected}.')",
+        "    print('  Reads were lost (mixed single/multi-read files or corrupt files?).')",
+        "    print('  Convert this run with nanopore_converter.py, which handles both.')",
+        "    sys.exit(1)",
+        "print(f'  Verified {got} reads')",
+        "VERIFY_EOF",
+    ]
+
+
+def _guarded_block(run_name: str, body: list[str], cleanup: str | None = None) -> list[str]:
+    """Run body in a fail-fast subshell; a failure is recorded and the script
+    continues with the next run (exit status 1 at the end).
+
+    The subshell's status is checked on a separate line on purpose: inside
+    `( ... ) || ...` bash would silently disable `set -e`.
+    """
+    q = _sh_quote
+    lines = ["(", "  set -e"]
+    in_heredoc = False
+    for line in body:  # heredoc bodies must stay unindented
+        if in_heredoc:
+            lines.append(line)
+            if line in ("VERIFY_EOF", "PATCH_EOF"):
+                in_heredoc = False
+        else:
+            lines.append("  " + line)
+            if line.endswith(("<< 'VERIFY_EOF'", "<< 'PATCH_EOF'")):
+                in_heredoc = True
+    lines.append(")")
+    on_fail = f"rm -rf {q(cleanup)}; " if cleanup else ""
+    lines.append(f"if [ $? -ne 0 ]; then {on_fail}FAILED+=({q(run_name)}); "
+                 f"echo {q(f'FAILED: {run_name}')} >&2; fi")
+    return lines
+
+
+def _pod5_conversion_lines(run_name: str, info: dict, fmt: str, detail: dict,
+                           output_dir: str | None) -> list[str]:
+    """Re-runnable bash block converting one run's fast5 to pod5.
+
+    - Output: <output_dir>/<run>/pod5, or <run>/pod5_from_fast5 in place.  The
+      in-place name is fixed (not chosen by what exists) so re-checking a
+      converted run never schedules the same conversion again.
+    - Skipped when the output already holds .pod5 files, so a failed run can
+      be fixed and the script simply re-run.
+    - Work happens in <base>/.convert_tmp and is moved into place only after
+      the read count is verified; the input is only the detected fast5
+      folders (or the run root for root/numeric-folder layouts).
+    """
+    q = _sh_quote
+    run_path = info.get("run_path", "")
+    inputs = detail.get("directories") or [run_path]
+    if output_dir:
+        base = os.path.join(output_dir, run_name)
+        out = os.path.join(base, "pod5")
+    else:
+        base = run_path
+        out = os.path.join(run_path, "pod5_from_fast5")
+    work = os.path.join(base, ".convert_tmp")
+    partial = os.path.join(work, "pod5")
+    multi_tmp = os.path.join(work, "multi_fast5")
+
+    lines = [f"# --- {run_name} ({fmt} -> pod5) ---"]
+    lines.append(f"if compgen -G {q(out)}'/*.pod5' > /dev/null; then")
+    lines.append(f"  echo {q(f'Skipping {run_name}: already converted in {out}')}")
+    lines.append("else")
+    steps = ", two steps" if fmt == "single_read_fast5" else ""
+    body = [f"echo {q(f'Converting {run_name} ({fmt} -> pod5{steps})...')}",
+            f"rm -rf {q(work)}",
+            f"mkdir -p {q(partial)}"]
+    if fmt == "single_read_fast5":
+        body.append(f"mkdir -p {q(multi_tmp)}")
+        for i, d in enumerate(inputs):
+            # Distinct filename prefix per input folder so batches don't collide
+            body.append(f"single_to_multi_fast5 -i {q(d)} -s {q(multi_tmp)} -f batch{i} -t 4 --recursive")
+        pod5_inputs = [multi_tmp + "/"]
+    else:
+        pod5_inputs = [d.rstrip("/") + "/" for d in inputs]
+    body.append("pod5 convert fast5 " + " ".join(q(i) for i in pod5_inputs)
+                + f" --output {q(partial + '/')} --threads 20 --recursive")
+    body.extend(_verify_read_count_lines(inputs, partial, work))
+    chem = info.get("chemistry")
+    if chem:
+        body.extend(_pod5_metadata_fix_lines(partial, chem))
+    body.append(f"mkdir -p {q(os.path.dirname(out))}")
+    body.append(f"if [ -d {q(out)} ]; then rmdir {q(out)}; fi  # empty leftover (non-empty: fail)")
+    body.append(f"mv {q(partial)} {q(out)}")
+    body.append(f"rm -rf {q(work)}")
+    lines.extend(_guarded_block(run_name, body, cleanup=work))
+    lines.append("fi")
+    lines.append("")
+    return lines
+
+
 def generate_conversion_script(runs: dict, target_format: str, output_dir: str | None = None):
     """Generate a bash conversion script.
 
@@ -1400,7 +1544,11 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str |
         "#!/usr/bin/env bash",
         "# Auto-generated nanopore format conversion script",
         f"# Target format: {target_format}",
-        "set -euo pipefail",
+        "# Safe to re-run: runs whose output already holds .pod5 files are skipped.",
+        "# Each run executes fail-fast in its own subshell; a failed run is",
+        "# reported and the script continues, exiting 1 at the end.",
+        "set -uo pipefail",
+        "FAILED=()",
         "",
     ]
 
@@ -1422,59 +1570,31 @@ def generate_conversion_script(runs: dict, target_format: str, output_dir: str |
                 lines.append("")
                 continue
 
-            if target_format == "pod5" and fmt == "multi_read_fast5":
-                if output_dir:
-                    out = os.path.join(output_dir, run_name, "pod5")
-                elif "pod5" in info["formats"]:
-                    # Do not mix converted output with an existing pod5/ folder
-                    out = os.path.join(run_path, "pod5_from_fast5")
-                else:
-                    out = os.path.join(run_path, "pod5")
-                lines.append(f"echo {q(f'Converting {run_name} ({fmt} -> pod5)...')}")
-                lines.append(f"mkdir -p {q(out)}")
-                lines.append(f"pod5 convert fast5 {q(run_path + '/')} --output {q(out + '/')} --threads 20 --recursive")
-                # Patch metadata if chemistry was detected from source fast5
-                chem = info.get("chemistry")
-                if chem:
-                    lines.extend(_pod5_metadata_fix_lines(out, chem))
-                lines.append("")
-
-            elif target_format == "pod5" and fmt == "single_read_fast5":
-                if output_dir:
-                    base = os.path.join(output_dir, run_name)
-                else:
-                    base = run_path
-                multi_tmp = os.path.join(base, "multi_fast5_tmp")
-                if not output_dir and "pod5" in info["formats"]:
-                    out = os.path.join(base, "pod5_from_fast5")
-                else:
-                    out = os.path.join(base, "pod5")
-                lines.append(f"echo {q(f'Converting {run_name} ({fmt} -> pod5, two steps)...')}")
-                lines.append(f"mkdir -p {q(multi_tmp)}")
-                lines.append(f"single_to_multi_fast5 -i {q(run_path)} -s {q(multi_tmp)} -t 4 --recursive")
-                lines.append(f"mkdir -p {q(out)}")
-                lines.append(f"pod5 convert fast5 {q(multi_tmp + '/')} --output {q(out + '/')} --threads 20 --recursive")
-                # Patch metadata if chemistry was detected from source fast5
-                chem = info.get("chemistry")
-                if chem:
-                    lines.extend(_pod5_metadata_fix_lines(out, chem))
-                lines.append(f"# intermediate multi-read fast5 kept in {q(multi_tmp)} -- remove manually if no longer needed")
-                lines.append("")
+            if target_format == "pod5" and fmt in ("multi_read_fast5", "single_read_fast5"):
+                lines.extend(_pod5_conversion_lines(run_name, info, fmt, detail, output_dir))
 
             elif target_format == "single_fast5" and fmt == "multi_read_fast5":
-                dirs = detail.get("directories", [])
+                dirs = detail.get("directories") or [run_path]
+                base = (os.path.join(output_dir, run_name, "single_fast5") if output_dir
+                        else os.path.join(run_path, "single_fast5"))
                 for d in dirs:
-                    if output_dir:
-                        out = os.path.join(output_dir, run_name, "single_fast5")
-                        if len(dirs) > 1:
-                            out = os.path.join(out, os.path.basename(d))
-                    else:
-                        out = os.path.join(os.path.dirname(d), "single_fast5")
-                    lines.append(f"echo {q(f'Converting {run_name} ({fmt} -> single_fast5)...')}")
-                    lines.append(f"mkdir -p {q(out)}")
-                    lines.append(f"multi_to_single_fast5 --input_path {q(d)} --save_path {q(out)} --recursive")
+                    # One output folder per input folder: fast5_pass and
+                    # fast5_fail are not mixed together.
+                    sub = "root" if os.path.normpath(d) == os.path.normpath(run_path) \
+                        else os.path.basename(os.path.normpath(d))
+                    out = os.path.join(base, sub)
+                    lines.extend(_guarded_block(f"{run_name}/{sub}", [
+                        f"echo {q(f'Converting {run_name} ({fmt} -> single_fast5): {sub}')}",
+                        f"mkdir -p {q(out)}",
+                        f"multi_to_single_fast5 --input_path {q(d)} --save_path {q(out)} --recursive",
+                    ]))
                     lines.append("")
 
+    lines.append('if [ ${#FAILED[@]} -gt 0 ]; then')
+    lines.append('  echo "${#FAILED[@]} run(s) failed: ${FAILED[*]}" >&2')
+    lines.append('  exit 1')
+    lines.append('fi')
+    lines.append('echo "All conversions finished."')
     return "\n".join(lines)
 
 
@@ -1583,7 +1703,10 @@ def main():
     )
     args = parser.parse_args()
 
-    target = Path(args.target_folder)
+    # Absolute paths, so the generated script works from any directory
+    target = Path(args.target_folder).resolve()
+    if args.output_dir:
+        args.output_dir = os.path.abspath(args.output_dir)
     if not target.is_dir():
         print(f"Error: '{target}' is not a directory", file=sys.stderr)
         sys.exit(1)
