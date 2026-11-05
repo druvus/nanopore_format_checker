@@ -41,6 +41,13 @@ COMPRESSED_EXTENSIONS = {
 
 log = logging.getLogger("compress_folders")
 
+# Set on Ctrl-C so archives in progress stop at the next entry
+_STOP = threading.Event()
+
+
+class Cancelled(Exception):
+    """Raised inside a worker when the run is being interrupted."""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -195,8 +202,12 @@ def _add_tree(tar: tarfile.TarFile, src: Path, arcname: str, on_skip) -> None:
     instead of aborting the whole archive.  An unreadable directory is still
     stored as an (empty) directory entry so the tree structure is kept.
     """
-    stack = [(str(src), arcname)]
+    # A top-level symlink to a folder is archived as the folder's content,
+    # not as a bare link (which would hold no data at all).
+    stack = [(os.path.realpath(src) if os.path.islink(src) else str(src), arcname)]
     while stack:
+        if _STOP.is_set():
+            raise Cancelled("interrupted")
         path, arc = stack.pop()
         try:
             tarinfo = tar.gettarinfo(path, arc)
@@ -209,6 +220,11 @@ def _add_tree(tar: tarfile.TarFile, src: Path, arcname: str, on_skip) -> None:
             try:
                 fh = open(path, "rb")
             except OSError as e:
+                # gettarinfo() already registered this inode, so a later hard
+                # link to it would be stored as a link to a missing member.
+                for key, name in list(tar.inodes.items()):
+                    if name == arc:
+                        del tar.inodes[key]
                 on_skip(arc, e)
                 continue
             with fh:
@@ -242,9 +258,12 @@ def compress_directory(
             progress.complete(name)
             return
 
-        # An unlistable top-level folder is an error, not an empty archive:
-        # an empty archive would be skipped as "output exists" on every re-run.
-        os.listdir(src)
+        # An unlistable (or listable but untraversable, mode r--) top-level
+        # folder is an error, not an empty archive: an empty archive would be
+        # skipped as "output exists" on every re-run.
+        children = os.listdir(src)
+        if children:
+            os.lstat(os.path.join(src, children[0]))
 
         # Scan size (tolerant of permission errors)
         size, file_count = _dir_size(src)
@@ -370,8 +389,16 @@ def _build_task_list(
     items = sorted(input_dir.iterdir())
     tasks: list[tuple[str, Path, Path]] = []
     skipped: list[Path] = []
+    out_real = output_dir.resolve()
 
     for p in items:
+        real = p.resolve()
+        if real == out_real or real in out_real.parents:
+            # The output folder (or a folder containing it) would be archived
+            # into itself, including other workers' partial .tmp files.
+            log.warning("Skipping %s: it contains the output directory", p.name)
+            skipped.append(p)
+            continue
         if p.is_dir():
             dest = output_dir / _dest_name_for_dir(p)
             tasks.append(("compress", p, dest))
@@ -385,6 +412,20 @@ def _build_task_list(
             skipped.append(p)
 
     return tasks, skipped
+
+
+def _split_conflicts(
+    tasks: list[tuple[str, Path, Path]]
+) -> tuple[list[tuple[str, Path, Path]], list[tuple[str, Path, Path]]]:
+    """Separate tasks whose destination is shared with another task (e.g.
+    folder run1/ and file run1.tar.gz both -> run1.tar.gz); running both
+    would let the last writer silently replace the other's archive."""
+    by_dest: dict[Path, list] = {}
+    for task in tasks:
+        by_dest.setdefault(task[2], []).append(task)
+    ok = [t for t in tasks if len(by_dest[t[2]]) == 1]
+    conflicts = [t for t in tasks if len(by_dest[t[2]]) > 1]
+    return ok, conflicts
 
 
 def process(
@@ -403,6 +444,7 @@ def process(
     log.info("Workers: %d", workers)
 
     tasks, skipped = _build_task_list(input_dir, output_dir)
+    tasks, conflicts = _split_conflicts(tasks)
 
     # Pre-check what already exists in the output
     existing_outputs = set()
@@ -436,13 +478,17 @@ def process(
             n_already_done, len(tasks),
         )
 
-    total = len(tasks)
+    total = len(tasks) + len(conflicts)
     if total == 0:
         log.warning("Nothing to process.")
         return 0
 
     progress = ProgressTracker(total=total)
     log.info("─" * 72)
+    for _action, src, dest in conflicts:
+        log.error("  %s and another item would both be written to %s; "
+                  "rename one of them", src.name, dest.name)
+        progress.error(src.name)
 
     dispatch = {
         "compress": compress_directory,
@@ -450,7 +496,8 @@ def process(
         "copy": copy_archive,
     }
 
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="worker") as pool:
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="worker")
+    try:
         futures = []
         for action, src, dest in tasks:
             fn = dispatch[action]
@@ -460,6 +507,14 @@ def process(
             exc = fut.exception()
             if exc:
                 log.error("Unexpected worker error: %s", exc)
+    except KeyboardInterrupt:
+        # Without this, the executor would still run every queued item.
+        log.warning("Interrupted: cancelling queued items, stopping running ones...")
+        _STOP.set()
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    finally:
+        pool.shutdown(wait=True)
 
     if skipped:
         log.debug(
