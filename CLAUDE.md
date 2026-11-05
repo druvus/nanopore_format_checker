@@ -86,7 +86,7 @@ Single script with no module structure. Key functions:
 - `analyze_run()` - Core function that classifies a single run directory. Detection priority: pod5 dirs -> fast5 dirs -> fast5 in root/numeric subdirs -> compressed archives -> unknown
 - `find_fast5_samples()` / `classify_fast5_samples()` - Collect up to 5 sample files (files before subfolders, up to 4 levels, symlinks followed with a loop guard, entry budget) and classify from the first one h5py can parse; size fallback only if none parses
 - `classify_fast5()` / `classify_fast5_by_structure()` / `classify_fast5_by_size()` - Single-file classification by HDF5 root group (`read_*` groups = multi-read), 1 MB size threshold as fallback
-- `is_raw_archive()` - Decides whether a file is a raw-data archive (`.tar`, `.tar.gz`, `.tgz`, `.gz`), excluding gzipped text/sequence outputs like `sequencing_summary.txt.gz`
+- `is_raw_archive()` - Decides whether a file is a raw-data archive (tar in any compression, `.zip`, `.gz`), excluding gzipped text/sequence outputs like `sequencing_summary.txt.gz`
 - `fast_count_files()` / `estimate_dir_size()` - Uses `os.scandir` for performance with large directories (100k+ single-read fast5 files); sampling-based size estimation for very large directories
 - `diagnose_unknown()` - Gathers diagnostic info when a run matches no known format
 - `generate_conversion_script()` / `_pod5_conversion_lines()` / `_guarded_block()` - Emit re-runnable bash: per run, skip if output holds .pod5; otherwise work in `<base>/.convert_tmp`, convert only the detected fast5 folders, verify read counts (`_verify_read_count_lines`), patch metadata, move into place. Each run is a fail-fast subshell whose status is checked on its own line (`( ... ) ||` would disable `set -e` inside); failures are collected and the script exits 1 at the end. In-place output is always `<run>/pod5_from_fast5`
@@ -110,7 +110,7 @@ Pore type inference: `FLOWCELL_PORE` table (21 entries) -> `KIT_PORE` table (55 
 
 ### Detection strategy
 
-The tool searches for format-specific subdirectories (`pod5/`, `pod5_pass/`, `fast5/`, `fast5_pass/`, `fastq_pass/`, etc.) up to 5 levels deep via `discover_run_structure()`. For fast5, it samples one file and classifies it by its HDF5 root layout (size fallback). Archive detection only runs when no pod5/fast5 data was found. Barcoded layouts (e.g., `fast5_pass/barcode13/`) are handled by descending into subdirectories during sampling.
+The tool searches for format-specific subdirectories (`pod5/`, `pod5_pass/`, `fast5/`, `fast5_pass/`, `fastq_pass/`, etc.) up to 5 levels deep via `discover_run_structure()`. For fast5, it samples up to five files and classifies by the first readable HDF5 root layout (size fallback). Symlinked folders are followed; hidden folders are skipped. Archive detection only runs when no pod5/fast5 data was found. Barcoded layouts (e.g., `fast5_pass/barcode13/`) are handled by descending into subdirectories during sampling.
 
 ### Converter (`nanopore_converter.py`)
 
@@ -118,7 +118,7 @@ Single script that orchestrates format conversion via subprocess calls. Key func
 
 - `parse_args()` - CLI argument parsing (input, --output-dir, --threads, --force, --verbose)
 - `check_tools()` - Verifies `single_to_multi_fast5` and `pod5` are on PATH; exits with code 2 if missing
-- `detect_input_type()` - Auto-detects whether input is a directory, archive (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tar`, `.zip`), or list file (`.txt`, `.csv`, `.list`)
+- `detect_input_type()` - Auto-detects whether input is a directory, archive (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz`, `.tar`, `.zip`), or list file (`.txt`, `.csv`, `.list`)
 - `extract_archive()` - Extracts compressed archives to a temp directory (tar uses the `data` extraction filter to block path traversal); caller handles cleanup
 - `parse_list_file()` - Reads a text file of paths (one per line, skips blanks and `#` comments)
 - `resolve_inputs()` - Resolves the input argument to a flat list of paths to process
