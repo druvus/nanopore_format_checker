@@ -39,6 +39,84 @@ try:
 except ImportError:
     HAS_POD5 = False
 
+# ---------------------------------------------------------------------------
+# Reading fast5/pod5 files in a worker process with a timeout
+# ---------------------------------------------------------------------------
+# Some corrupted HDF5 files make the HDF5 C library loop forever while
+# reading metadata. That loop cannot be interrupted from Python (signal
+# handlers never run), so file reads go to a forked worker process that is
+# killed and replaced when one file takes longer than FILE_TIMEOUT seconds.
+
+FILE_TIMEOUT = float(os.environ.get("NANOPORE_FILE_TIMEOUT", "60"))
+
+
+class FileTimeout(Exception):
+    """A file could not be read within FILE_TIMEOUT seconds (likely corrupt)."""
+
+
+def _isolated_worker(conn) -> None:
+    while True:
+        try:
+            func, args = conn.recv()
+        except (EOFError, OSError):
+            return
+        try:
+            conn.send((True, func(*args)))
+        except Exception as e:  # report, keep serving
+            conn.send((False, repr(e)))
+
+
+class _IsolatedCaller:
+    """Runs module-level functions in a long-lived forked worker process."""
+
+    def __init__(self):
+        self._proc = None
+        self._conn = None
+
+    def _start(self) -> None:
+        import multiprocessing
+        ctx = multiprocessing.get_context("fork")
+        self._conn, child = ctx.Pipe()
+        self._proc = ctx.Process(target=_isolated_worker, args=(child,), daemon=True)
+        self._proc.start()
+        child.close()
+
+    def call(self, func, *args, timeout: float | None = None):
+        """Return func(*args) computed in the worker. Raises FileTimeout if it
+        does not answer in time (the worker is then killed and replaced) and
+        RuntimeError if func raised."""
+        if self._proc is None or not self._proc.is_alive():
+            self._start()
+        self._conn.send((func, args))
+        if not self._conn.poll(FILE_TIMEOUT if timeout is None else timeout):
+            self.close()
+            raise FileTimeout(f"no answer within {FILE_TIMEOUT if timeout is None else timeout:g} s")
+        ok, value = self._conn.recv()
+        if not ok:
+            raise RuntimeError(value)
+        return value
+
+    def close(self) -> None:
+        if self._proc is not None:
+            self._proc.kill()
+            self._proc.join()
+            self._conn.close()
+        self._proc = self._conn = None
+
+
+_ISOLATED = _IsolatedCaller()
+
+
+def isolated(func, *args, default=None):
+    """func(*args) in the worker; `default` on timeout or error."""
+    try:
+        return _ISOLATED.call(func, *args)
+    except FileTimeout:
+        return default
+    except RuntimeError:
+        return default
+
+
 FLOWCELL_PORE = {
     # R10.4.1
     "FLO-MIN114": "R10.4.1",
@@ -538,7 +616,7 @@ def classify_fast5_samples(samples: list[Path]) -> tuple[str, Path | None]:
     heuristic apply.  Returns (classification, sample used).
     """
     for sample in samples:
-        by_structure = classify_fast5_by_structure(sample)
+        by_structure = isolated(classify_fast5_by_structure, sample)
         if by_structure:
             return by_structure, sample
     for sample in samples:
@@ -1029,7 +1107,7 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
         if result["chemistry"] is None:
             readable = [d for d in all_pod5_dirs if str(d) not in unreadable_pod5]
             for pod5_file in find_fast5_samples(readable, ext=".pod5"):
-                chem = extract_chemistry(pod5_file, "pod5")
+                chem = isolated(extract_chemistry, pod5_file, "pod5")
                 if chem:
                     result["chemistry"] = chem
                     result["chemistry_classification"] = classify_chemistry(chem)
@@ -1048,7 +1126,7 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
             result["formats"].append("pod5")
             result["details"]["pod5"] = pod5_detail
             for pod5_file in root_pod5:
-                chem = extract_chemistry(pod5_file, "pod5")
+                chem = isolated(extract_chemistry, pod5_file, "pod5")
                 if chem:
                     result["chemistry"] = chem
                     result["chemistry_classification"] = classify_chemistry(chem)
@@ -1114,7 +1192,7 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
                     fast5_info["note"] = "Install h5py to distinguish single/multi read fast5"
 
             if sample_file and result["chemistry"] is None:
-                chem = extract_chemistry(sample_file, "fast5")
+                chem = isolated(extract_chemistry, sample_file, "fast5")
                 if chem:
                     result["chemistry"] = chem
                     result["chemistry_classification"] = classify_chemistry(chem)
@@ -1195,7 +1273,7 @@ def analyze_run(run_path: Path, quick: bool = False) -> dict:
                     fast5_info["size_estimated"] = True
 
             if result["chemistry"] is None:
-                chem = extract_chemistry(sample_file, "fast5")
+                chem = isolated(extract_chemistry, sample_file, "fast5")
                 if chem:
                     result["chemistry"] = chem
                     result["chemistry_classification"] = classify_chemistry(chem)

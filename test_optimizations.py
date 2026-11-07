@@ -1853,6 +1853,42 @@ def test_single_fast5_root_layout_in_place_is_skipped(tmp_path: Path) -> None:
     print("  PASS: single_fast5 root layout in place is skipped")
 
 
+def _sleep_forever(*args):
+    import time
+    time.sleep(3600)
+
+
+def test_hanging_file_read_times_out(tmp_path: Path) -> None:
+    """A read stuck inside the HDF5 library (corrupt file) is abandoned."""
+    import time
+    import nanopore_format_checker as fc
+    old = fc.FILE_TIMEOUT
+    fc.FILE_TIMEOUT = 0.5
+    try:
+        start = time.monotonic()
+        assert fc.isolated(_sleep_forever, "x", default="fallback") == "fallback"
+        assert time.monotonic() - start < 10
+        # The worker was replaced and keeps working
+        assert fc.isolated(len, "abc") == 3
+        assert fc.isolated(int, "not a number", default=-1) == -1
+        # A run whose chemistry read hangs is still classified
+        make_file(tmp_path / "20240101_run" / "fast5" / "a.fast5", size=10)
+        orig = fc.extract_chemistry
+        fc.extract_chemistry = _sleep_forever
+        start = time.monotonic()
+        try:
+            result = fc.analyze_run(tmp_path / "20240101_run", quick=True)
+        finally:
+            fc.extract_chemistry = orig
+        assert 0.4 < time.monotonic() - start < 10  # the hanging read was attempted
+        assert result["formats"], result
+        assert result["chemistry"] is None
+    finally:
+        fc.FILE_TIMEOUT = old
+        fc._ISOLATED.close()
+    print("  PASS: hanging file read times out")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -1967,6 +2003,7 @@ def main():
         test_uppercase_fast5_extension_is_counted,
         test_conversion_hints_create_the_output_folder,
         test_single_fast5_root_layout_in_place_is_skipped,
+        test_hanging_file_read_times_out,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:

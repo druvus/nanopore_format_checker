@@ -98,11 +98,12 @@ The converter auto-detects the input type and opens **every** fast5 file (about 
 - **single-read files**: merged with `single_to_multi_fast5`, then converted with `pod5 convert fast5`
 - **multi-read files**: converted with `pod5 convert fast5` directly
 - **Unreadable/corrupt files** (e.g. truncated after a MinKNOW crash): skipped with a warning naming them, and counted again in the final summary. A *folder* that cannot be read (permissions) fails the item instead, since its reads would otherwise be dropped silently. Files the tools cannot convert (single-read files without a read ID, signal, channel or run ID; multi-read files without signal) are skipped the same way instead of making a tool abandon its whole batch; empty multi-read files are ignored.
+- **Files that hang the HDF5 library**: some corrupt fast5 files make h5py loop forever. Each file is read in a separate worker process with a time limit (60 s per file, set with the environment variable `NANOPORE_FILE_TIMEOUT`); a file that exceeds it is skipped like any other corrupt file and the scan continues. The format checker reads its sample files the same way.
 - **Symlinked folders** (e.g. data moved to another disk and linked back) are followed. Hidden folders, macOS `._*` files and `__MACOSX/` are ignored.
 - **Duplicate copies**: a file whose reads (by read ID) were already found elsewhere in the input, such as a backup copy, is skipped with a warning; a multi-read file that only partly overlaps fails the item.
 - **Read-count verification**: both tools exit 0 after silently skipping files they cannot handle, so the pod5 output must contain exactly the input's read IDs, each once, otherwise the item fails and nothing is published. Tool warnings and errors are shown even when the tool succeeds.
 - **Metadata fill**: after conversion, empty flowcell / kit / sample-rate fields in the pod5 RunInfo are filled from the source fast5 (values pod5 wrote are never changed). `pod5 convert` only reads `tracking_id`, so without this older runs that store the flowcell in `context_tags` lose it, and dorado's automatic model selection fails. Needs `nanopore_format_checker.py` next to the converter; skipped with a warning otherwise.
-- **Compressed archives** (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz`, `.tar`, `.zip`): safely extracted to a temp directory, converted, then cleaned up; output is named after the archive
+- **Compressed archives** (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz`, `.tar`, `.zip`): safely extracted into a hidden `.extract_*` folder inside `--output-dir` (or `--tmp-dir`), converted, then removed; output is named after the archive. The system temp folder is not used, since it is often small or in memory and an extracted run can be very large
 
 Output is written to `<output-dir>/<input_name>/pod5/`.
 
@@ -120,6 +121,7 @@ The input list file supports one path per line (folders and archives can be mixe
 | `--output-dir DIR` | | Required. Base output directory for converted pod5 files |
 | `--threads N` | | Thread count for conversion tools (default: 4) |
 | `--force` | | Re-convert inputs that already have output (default: skip them) |
+| `--tmp-dir DIR` | | Where archives are extracted (default: a hidden folder in `--output-dir`) |
 | `--verbose` | `-v` | Enable detailed logging |
 
 #### Exit codes
@@ -139,7 +141,7 @@ python compress_folders.py /data/raw /data/compressed --dry-run   # preview
 python compress_folders.py /data/raw /data/compressed -w 4        # 4 parallel workers
 ```
 
-- **Safe re-runs:** each archive is written to a temp file and renamed into place when complete, and items whose archive already exists are skipped.
+- **Safe re-runs:** each archive is written to a temp file and renamed into place when complete, and items whose archive already exists are skipped. An existing archive only counts as done if its top-level entry is the folder's name; an unrelated archive with the same name is reported as an error and left alone.
 - **Symlinked folders** at the top level are archived with their content (not as a bare link).
 - **Name clashes:** two items that would produce the same archive (e.g. folder `run1/` and file `run1.tar.gz`) are both reported as errors and neither is written. An output directory inside the input directory is never archived into itself.
 - **Ctrl-C and SIGTERM** (e.g. a scheduler time limit) cancel queued items and stop archives, copies and `.tar` recompression in progress (their temp files are removed); re-run to continue.
@@ -208,6 +210,7 @@ Generated scripts handle:
 - **Safe re-runs**: runs whose output already holds `.pod5` files are skipped; work happens in a hidden `.convert_tmp/` folder that is moved into place only on success.
 - **Failures are isolated**: each run executes fail-fast in its own subshell; a failed run is reported, the script continues with the next one and exits 1 at the end, listing the failed runs.
 - **Read-count verification**: before publishing, an embedded check compares the reads in the fast5 input with the pod5 output (following symlinked folders, as the tools do) and rejects duplicated reads. A folder or file that cannot be read because of permissions fails the run (the tools would silently skip it); corrupt files are skipped with a warning, since their reads cannot be recovered. The script detects a run's format from a few sample files, so a run that mixes single- and multi-read files (or has corrupt files) fails this check rather than losing reads silently; convert such runs with `nanopore_converter.py`, which classifies every file.
+- **Files that hang the HDF5 library**: the scripts call the tools directly and have no per-file time limit, so a run with such a file can hang. `nanopore_converter.py` skips these files (see above).
 - **Metadata patching**: When chemistry was detected from the source fast5 files, the script includes a post-conversion step that writes the detected flowcell, kit, and sample rate into the pod5 RunInfo using the pod5 Python API. dorado's automatic model selection (`dorado basecaller sup ...`) looks these three fields up in its chemistry table, so without them older runs can only be basecalled with an explicit model name. A run with no flowcell code anywhere in its fast5 still needs the explicit model; the tool does not guess one. Files that already carry the right values (compared case-insensitively, as dorado does) are not rewritten.
 - **Unsupported conversions are not emitted**: runs whose data is only in compressed archives become `# SKIPPED` comments; `--convert-to single_fast5` only converts multi-read fast5 into `<run>/single_from_fast5/from__<folder path>/` (one output folder per input folder, so pass/fail and different samples stay separate; the names never match the detection patterns, so re-checking a run does not mistake the output for input).
 - **Unusual folder names**: paths are quoted, newlines in names cannot escape comments, and `[ ] * ?` in paths are safe (pod5 reads its inputs through symlinks with plain names).
@@ -216,13 +219,13 @@ Generated scripts handle:
 ## Tests
 
 ```bash
-# Format checker tests (108 tests)
+# Format checker tests (109 tests)
 python test_optimizations.py
 
-# Converter tests (62 tests)
+# Converter tests (64 tests)
 python -m pytest test_nanopore_converter.py -v
 
-# Archiver tests (18 tests; 2 need a non-root user)
+# Archiver tests (19 tests; 2 need a non-root user)
 python -m pytest test_compress_folders.py -v
 
 # End-to-end tests with the real pod5 / single_to_multi_fast5 tools (8 tests; one needs a non-root user;
