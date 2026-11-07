@@ -13,7 +13,8 @@ Dependencies:
     - pod5 (optional, for pod5 validation)
 
 Install:
-    pip install h5py ont_fast5_api pod5
+    pip install h5py pod5   (ont_fast5_api only for generated conversion scripts;
+                             see README for its install workaround)
 """
 
 import argparse

@@ -7,8 +7,9 @@ Converts single_read_fast5 and multi_read_fast5 to pod5 format.
 Accepts a folder, compressed archive (.tar.gz, .tar.bz2, .zip), or a text
 file listing paths (one per line, mixed folders and archives).
 
-Dependencies:
-    pip install ont_fast5_api pod5
+Dependencies (a plain `pip install ont_fast5_api` fails on current Python):
+    pip install h5py pod5 progressbar2 packaging "setuptools<81"
+    pip install --no-deps ont_fast5_api
 
 Usage:
     python nanopore_converter.py /path/to/input --output-dir /path/to/output
@@ -87,7 +88,8 @@ def check_tools():
             missing.append(tool)
     if missing:
         logger.error("Required tools not found on PATH: %s", ", ".join(missing))
-        logger.error("Install with: pip install ont_fast5_api pod5")
+        logger.error('Install with: pip install h5py pod5 progressbar2 packaging "setuptools<81" '
+                     '&& pip install --no-deps ont_fast5_api')
         sys.exit(2)
 
 

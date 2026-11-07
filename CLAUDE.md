@@ -68,10 +68,11 @@ python -m pytest test_integration.py -v         # real pod5/single_to_multi_fast
 Python 3.12 or newer is required; each script exits with an error on older versions (version guard right after the stdlib imports). CI tests 3.12, 3.13 and 3.14.
 
 ```bash
-pip install h5py ont_fast5_api pod5
+pip install h5py pod5 progressbar2 packaging "setuptools<81"
+pip install --no-deps ont_fast5_api
 ```
 
-`ont_fast5_api` cannot be pip-installed normally on current Python (pinned `progressbar33` fails to build; it imports `pkg_resources`, gone from setuptools 81+): `pip install progressbar2 packaging "setuptools<81" && pip install --no-deps ont_fast5_api` (CI does this).
+A plain `pip install ont_fast5_api` fails on current Python (pinned `progressbar33` fails to build; it imports `pkg_resources`, gone from setuptools 81+); the two commands above are what CI runs.
 
 `h5py` is the only hard dependency for the format checker (fast5 inspection). `pod5` is optional for the checker (needed for pod5 chemistry extraction and metadata patching). The converter requires `ont_fast5_api` (provides `single_to_multi_fast5` CLI) and `pod5` (provides `pod5 convert fast5` CLI) to be installed and on PATH.
 

@@ -14,18 +14,16 @@ Tools for inspecting and converting Oxford Nanopore sequencing data.
 
 ## Installation
 
-```bash
-pip install h5py ont_fast5_api pod5
-```
-
-`h5py` is the only hard dependency for the format checker. The converter requires `ont_fast5_api` (provides `single_to_multi_fast5`) and `pod5` (provides `pod5 convert fast5`) to be installed and on PATH.
-
-Requires Python 3.12 or newer; the scripts exit with an error on older versions. On current Python versions `pip install ont_fast5_api` fails: its pinned `progressbar33` dependency no longer builds, and it imports `pkg_resources`, which setuptools 81+ no longer ships. Install it without dependencies, with the maintained `progressbar2` and an older setuptools (this is what CI does):
+Requires Python 3.12 or newer; the scripts exit with an error on older versions.
 
 ```bash
 pip install h5py pod5 progressbar2 packaging "setuptools<81"
 pip install --no-deps ont_fast5_api
 ```
+
+`h5py` is the only hard dependency for the format checker. The converter requires `ont_fast5_api` (provides `single_to_multi_fast5`) and `pod5` (provides `pod5 convert fast5`) to be installed and on PATH.
+
+A plain `pip install ont_fast5_api` fails on current Python: its pinned `progressbar33` dependency no longer builds, and it imports `pkg_resources`, which setuptools 81+ no longer ships. The commands above install it without dependencies, with the maintained `progressbar2` and an older setuptools (this is what CI does).
 
 To basecall the results you need [dorado](https://github.com/nanoporetech/dorado): the version depends on the chemistry, see [Dorado version recommendations](#dorado-version-recommendations).
 
