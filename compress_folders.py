@@ -21,6 +21,7 @@ import argparse
 import logging
 import os
 import shutil
+import signal
 import sys
 import tarfile
 import threading
@@ -224,9 +225,15 @@ def _add_tree(tar: tarfile.TarFile, src: Path, arcname: str, on_skip) -> None:
             except OSError as e:
                 # gettarinfo() already registered this inode, so a later hard
                 # link to it would be stored as a link to a missing member.
-                for key, name in list(tar.inodes.items()):
-                    if name == arc:
+                # Look the inode up directly: scanning tar.inodes for every
+                # unreadable file made large trees quadratic.
+                try:
+                    st = os.lstat(path)  # gettarinfo keys tar.inodes by (ino, dev)
+                    key = (st.st_ino, st.st_dev)
+                    if tar.inodes.get(key) == arc:
                         del tar.inodes[key]
+                except OSError:
+                    pass
                 on_skip(arc, e)
                 continue
             with fh:
@@ -415,7 +422,12 @@ def _build_task_list(
     out_real = output_dir.resolve()
 
     for p in items:
-        real = p.resolve()
+        try:
+            real = p.resolve()
+        except (OSError, RuntimeError) as e:  # symlink loop (RuntimeError on 3.12)
+            log.warning("Skipping %s: %s", p.name, e)
+            skipped.append(p)
+            continue
         if real == out_real or real in out_real.parents:
             # The output folder (or a folder containing it) would be archived
             # into itself, including other workers' partial .tmp files.
@@ -553,7 +565,19 @@ def process(
     return progress.errors
 
 
+def _install_signal_handlers() -> None:
+    """SIGTERM (scheduler time limits, kill) and SIGHUP get the same handling
+    as Ctrl-C: queued items are cancelled, archives in progress are stopped
+    and their temp files removed. Signals already ignored (nohup) stay so."""
+    def handler(signum, frame):
+        raise KeyboardInterrupt
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) is not signal.SIG_IGN:
+            signal.signal(sig, handler)
+
+
 def main() -> None:
+    _install_signal_handlers()
     cpu_count = os.cpu_count() or 4
     default_workers = min(cpu_count, 8)
 
