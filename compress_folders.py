@@ -87,6 +87,8 @@ def _dir_size(path: Path) -> tuple[int, int]:
     total = 0
     count = 0
     for root, _dirs, files in os.walk(path):
+        if _STOP.is_set():
+            raise Cancelled("interrupted")
         for fname in files:
             try:
                 total += os.path.getsize(os.path.join(root, fname))
@@ -242,6 +244,19 @@ def _add_tree(tar: tarfile.TarFile, src: Path, arcname: str, on_skip) -> None:
                 stack.append((os.path.join(path, child), f"{arc}/{child}"))
 
 
+def _copy_with_stop(src: Path, dest: Path, chunk: int = 16 * 1024 * 1024) -> None:
+    """shutil.copy2, but in chunks so Ctrl-C (_STOP) can interrupt a huge copy."""
+    with open(src, "rb") as fin, open(dest, "wb") as fout:
+        while True:
+            if _STOP.is_set():
+                raise Cancelled("interrupted")
+            block = fin.read(chunk)
+            if not block:
+                break
+            fout.write(block)
+    shutil.copystat(src, dest)
+
+
 def compress_directory(
     src: Path, dest_archive: Path, dry_run: bool, progress: ProgressTracker
 ) -> None:
@@ -293,6 +308,8 @@ def compress_directory(
         result_size = dest_archive.stat().st_size
         progress.complete(name, bytes_in=size, bytes_out=result_size)
 
+    except Cancelled:
+        log.info("  cancelled: %s", name)
     except Exception:
         log.exception("  ERROR compressing %s", name)
         progress.error(name)
@@ -320,7 +337,7 @@ def copy_archive(
 
         tmp = _atomic_tmp(dest)
         try:
-            shutil.copy2(src, tmp)
+            _copy_with_stop(src, tmp)
             tmp.rename(dest)
         except BaseException:
             tmp.unlink(missing_ok=True)
@@ -328,6 +345,8 @@ def copy_archive(
 
         progress.complete(name, bytes_in=size, bytes_out=size)
 
+    except Cancelled:
+        log.info("  cancelled: %s", name)
     except Exception:
         log.exception("  ERROR copying %s", name)
         progress.error(name)
@@ -358,6 +377,8 @@ def recompress_tar(
             with tarfile.open(src, "r:") as src_tar:
                 with tarfile.open(tmp, "w:gz") as dest_tar:
                     for member in src_tar:
+                        if _STOP.is_set():
+                            raise Cancelled("interrupted")
                         try:
                             fileobj = src_tar.extractfile(member) if member.isreg() else None
                             dest_tar.addfile(member, fileobj)
@@ -372,6 +393,8 @@ def recompress_tar(
         result_size = dest.stat().st_size
         progress.complete(name, bytes_in=size, bytes_out=result_size)
 
+    except Cancelled:
+        log.info("  cancelled: %s", name)
     except Exception:
         log.exception("  ERROR recompressing %s", name)
         progress.error(name)
@@ -407,6 +430,11 @@ def _build_task_list(
             tasks.append(("recompress", p, dest))
         elif p.is_file() and _get_archive_suffix(p):
             dest = output_dir / p.name
+            if real == dest.resolve():
+                # Output dir == input dir: this archive is already in place
+                # (possibly made by an earlier run of this tool).
+                skipped.append(p)
+                continue
             tasks.append(("copy", p, dest))
         else:
             skipped.append(p)
@@ -566,12 +594,17 @@ examples:
         log.info("  DRY-RUN MODE — no files will be written")
         log.info("═" * 72)
 
-    errors = process(
-        args.input_dir.resolve(),
-        args.output_dir.resolve(),
-        args.dry_run,
-        args.workers,
-    )
+    try:
+        errors = process(
+            args.input_dir.resolve(),
+            args.output_dir.resolve(),
+            args.dry_run,
+            args.workers,
+        )
+    except KeyboardInterrupt:
+        log.warning("Interrupted; archives in progress were discarded (no partial files left). "
+                    "Re-run to continue: finished archives are skipped.")
+        sys.exit(130)
     sys.exit(1 if errors else 0)
 
 
