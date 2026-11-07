@@ -192,7 +192,7 @@ How to basecall once you know the version:
   ```
 - **fast5 input**: no dorado version reads single-read fast5, so convert it to pod5. dorado 0.9.6 reads multi-read fast5 only with an explicit model (as above); converting to pod5 is still recommended.
 
-These points were checked by running dorado 0.9.6 on converted test data: automatic selection worked for pod5 with full or filled-in metadata, failed for pod5 without a flowcell code (and for any fast5), and the two-step explicit-model command worked.
+These points were checked by running dorado 0.9.6 on converted test data: automatic selection worked for pod5 with full or filled-in metadata, failed for pod5 without a flowcell code (and for any fast5), and the two-step explicit-model command worked. dorado 2.1.0 auto-selected `dna_r10.4.1_e8.2_400bps_fast@v5.2.0` for converted R10.4.1 5 kHz data and refused R9.4.1 data ("chemistry has been deprecated since Dorado v1.0.0").
 - An R10.4.1 run whose sample rate could not be read is reported as `>=1.0` with a note to use 0.9.6 if it was sampled at 4 kHz. R9.4.1 runs at a rate other than 4 kHz (e.g. early 6 kHz PromethION) are flagged, as dorado's R9.4.1 model expects 4 kHz.
 
 `--verbose` prints this advice per run, and the TSV includes `dorado_version`, `dorado_model` and `dorado_note` columns.
