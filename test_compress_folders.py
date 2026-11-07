@@ -244,3 +244,42 @@ def test_real_untraversable_top_level_directory(tmp_path):
         src.chmod(0o755)
     assert progress.errors == 1
     assert not (tmp_path / "out" / "run.tar.gz").exists()
+
+
+# ---------------------------------------------------------------------------
+# Audit round 3
+# ---------------------------------------------------------------------------
+
+def test_output_dir_equal_to_input_dir_reruns_cleanly(tmp_path):
+    """Regression: the second run saw its own archives as clashing inputs."""
+    d = tmp_path / "d"
+    (d / "run1").mkdir(parents=True)
+    (d / "run1" / "a.txt").write_text("a")
+    assert cf.process(d, d, dry_run=False, workers=2) == 0
+    assert cf.process(d, d, dry_run=False, workers=2) == 0
+    assert (d / "run1.tar.gz").exists()
+
+
+@pytest.mark.parametrize("worker", ["recompress_tar", "copy_archive"])
+def test_cancel_stops_recompress_and_copy_quietly(tmp_path, worker, caplog):
+    """Regression: Ctrl-C did not stop .tar recompression or archive copies,
+    and cancelled items were logged as errors with tracebacks."""
+    src_dir = tmp_path / "data"
+    src_dir.mkdir()
+    (src_dir / "f.bin").write_bytes(b"x" * 1000)
+    tar_path = tmp_path / "in.tar"
+    with tarfile.open(tar_path, "w") as tar:
+        tar.add(src_dir / "f.bin", arcname="f.bin")
+    out = tmp_path / "out"
+    out.mkdir()
+    dest = out / ("in.tar.gz" if worker == "recompress_tar" else "in.tar")
+    progress = cf.ProgressTracker(total=1)
+    cf._STOP.set()
+    try:
+        with caplog.at_level("INFO"):
+            getattr(cf, worker)(tar_path, dest, False, progress)
+    finally:
+        cf._STOP.clear()
+    assert not dest.exists() and list(out.iterdir()) == []
+    assert progress.errors == 0
+    assert "cancelled: in.tar" in caplog.text and "Traceback" not in caplog.text

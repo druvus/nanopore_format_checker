@@ -7,8 +7,9 @@ Converts single_read_fast5 and multi_read_fast5 to pod5 format.
 Accepts a folder, compressed archive (.tar.gz, .tar.bz2, .zip), or a text
 file listing paths (one per line, mixed folders and archives).
 
-Dependencies:
-    pip install ont_fast5_api pod5
+Dependencies (a plain `pip install ont_fast5_api` fails on current Python):
+    pip install h5py pod5 progressbar2 packaging "setuptools<81"
+    pip install --no-deps ont_fast5_api
 
 Usage:
     python nanopore_converter.py /path/to/input --output-dir /path/to/output
@@ -87,7 +88,8 @@ def check_tools():
             missing.append(tool)
     if missing:
         logger.error("Required tools not found on PATH: %s", ", ".join(missing))
-        logger.error("Install with: pip install ont_fast5_api pod5")
+        logger.error('Install with: pip install h5py pod5 progressbar2 packaging "setuptools<81" '
+                     '&& pip install --no-deps ont_fast5_api')
         sys.exit(2)
 
 
@@ -137,7 +139,7 @@ def extract_archive(archive_path: str) -> str:
     logger.info("Extracting %s to %s", archive_path, tmp_dir)
 
     try:
-        if name.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar")):
+        if name.endswith(tuple(e for e in ARCHIVE_EXTENSIONS if e != ".zip")):
             # "r:*" auto-detects gzip/bzip2/uncompressed
             with tarfile.open(archive_path, "r:*") as tar:
                 # Reject absolute paths, ".." traversal and device files
@@ -220,16 +222,46 @@ def _classify_fast5_structure(fpath: Path) -> str | None:
     return None
 
 
-def _inspect_fast5(fpath: Path) -> tuple[str, int] | None:
-    """Return ("single", 1) / ("multi", n_reads) for a readable fast5 file,
-    or None if it cannot be opened or has neither layout."""
+def _decode(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+@dataclass
+class Fast5Info:
+    kind: str                 # "single" or "multi"
+    read_ids: list[str]       # empty if the file does not record them
+    run_id: str | None        # tracking_id/run_id (= pod5 acquisition_id)
+
+
+def _inspect_fast5(fpath: Path) -> Fast5Info | None:
+    """Read a fast5 file's layout, read IDs and run ID; None if it cannot be
+    opened or has neither the single- nor the multi-read layout."""
     try:
         with h5py.File(fpath, "r") as f:
-            reads = sum(1 for key in f if key.startswith("read_"))
-            if reads:
-                return "multi", reads
+            keys = [k for k in f if k.startswith("read_")]
+            if keys:
+                run_id = None
+                try:
+                    run_id = _decode(f[keys[0]]["tracking_id"].attrs["run_id"])
+                except Exception:
+                    pass
+                return Fast5Info("multi", [k[len("read_"):] for k in keys], run_id)
             if "Raw" in f or "UniqueGlobalKey" in f:
-                return "single", 1
+                read_ids = []
+                try:
+                    for read in f["Raw/Reads"].values():
+                        if "read_id" in read.attrs:
+                            read_ids.append(_decode(read.attrs["read_id"]))
+                except Exception:
+                    pass
+                run_id = None
+                try:
+                    run_id = _decode(f["UniqueGlobalKey/tracking_id"].attrs["run_id"])
+                except Exception:
+                    pass
+                return Fast5Info("single", read_ids[:1], run_id)
     except Exception:
         return None
     return None
@@ -241,7 +273,14 @@ class Fast5Scan:
     single: list[Path] = field(default_factory=list)
     multi: list[Path] = field(default_factory=list)
     unreadable: list[Path] = field(default_factory=list)
+    unreadable_dirs: list[str] = field(default_factory=list)
+    duplicates: list[Path] = field(default_factory=list)      # whole file already seen
+    partial_duplicates: list[Path] = field(default_factory=list)
     expected_reads: int | None = 0  # None when reads could not be counted
+    # Read IDs of every converted file, when all files record them
+    read_ids: set[str] | None = field(default_factory=set)
+    # One readable sample file per run_id (for per-acquisition metadata)
+    run_samples: dict[str, Path] = field(default_factory=dict)
 
     @property
     def empty(self) -> bool:
@@ -251,29 +290,55 @@ class Fast5Scan:
         return (self.single or self.multi or [None])[0]
 
 
+def _skip_name(name: str) -> bool:
+    """Hidden files/folders (work folders such as .convert_tmp, macOS ._*
+    AppleDouble files) and macOS __MACOSX archive folders are never data."""
+    return name.startswith(".") or name == "__MACOSX"
+
+
 def scan_fast5_dir(dir_path: str, exclude: list[str] | None = None) -> Fast5Scan:
-    """Classify every .fast5 file under dir_path and count its reads.
+    """Classify every .fast5 file under dir_path and record its reads.
 
     Each file is opened with h5py (about 0.2 ms per file), so runs that mix
     single- and multi-read files (e.g. single-read fast5_pass/ with a
     multi-read fast5_fail/) are converted completely, and truncated or
     corrupt files are reported instead of derailing the whole run.
-    Directories in `exclude` (e.g. the output folder) are not descended into.
+
+    - Symlinked folders are followed (data is often linked in from other
+      storage), with a loop guard; folders in `exclude` (the output folder)
+      and hidden folders are skipped.
+    - Folders that cannot be listed are recorded in `unreadable_dirs`.
+    - Read IDs are collected so a second copy of the same reads (backups,
+      leftover work folders) is not converted twice: a file whose reads
+      were all seen already is skipped; one that is only partly duplicated
+      is recorded in `partial_duplicates`.
 
     Without h5py each file falls back to the 1 MB size heuristic and reads
     cannot be counted (expected_reads is None).
     """
     excluded = {os.path.realpath(e) for e in (exclude or [])}
+    visited: set[str] = set()
     scan = Fast5Scan()
     if not HAS_H5PY:
         scan.expected_reads = None
-    for dirpath, dirnames, filenames in os.walk(dir_path):
+        scan.read_ids = None
+
+    def on_error(err: OSError) -> None:
+        scan.unreadable_dirs.append(str(err.filename or err))
+
+    for dirpath, dirnames, filenames in os.walk(dir_path, followlinks=True, onerror=on_error):
+        real = os.path.realpath(dirpath)
+        if real in visited:          # symlink loop or the same folder linked twice
+            dirnames[:] = []
+            continue
+        visited.add(real)
         dirnames[:] = sorted(
             d for d in dirnames
-            if os.path.realpath(os.path.join(dirpath, d)) not in excluded
+            if not _skip_name(d)
+            and os.path.realpath(os.path.join(dirpath, d)) not in excluded
         )
         for fname in sorted(filenames):
-            if not fname.lower().endswith(".fast5"):
+            if not fname.lower().endswith(".fast5") or _skip_name(fname):
                 continue
             fpath = Path(dirpath) / fname
             if not HAS_H5PY:
@@ -287,12 +352,24 @@ def scan_fast5_dir(dir_path: str, exclude: list[str] | None = None) -> Fast5Scan
             info = _inspect_fast5(fpath)
             if info is None:
                 scan.unreadable.append(fpath)
-            elif info[0] == "single":
-                scan.single.append(fpath)
-                scan.expected_reads += 1
-            else:
-                scan.multi.append(fpath)
-                scan.expected_reads += info[1]
+                continue
+            n_reads = len(info.read_ids) if info.kind == "multi" else 1
+            if scan.read_ids is not None:
+                if info.read_ids:
+                    seen = [r for r in info.read_ids if r in scan.read_ids]
+                    if seen and len(seen) == len(info.read_ids):
+                        scan.duplicates.append(fpath)
+                        continue
+                    if seen:
+                        scan.partial_duplicates.append(fpath)
+                        continue
+                    scan.read_ids.update(info.read_ids)
+                else:
+                    scan.read_ids = None  # cannot verify by ID; fall back to counts
+            if info.run_id and info.run_id not in scan.run_samples:
+                scan.run_samples[info.run_id] = fpath
+            (scan.single if info.kind == "single" else scan.multi).append(fpath)
+            scan.expected_reads += n_reads
     return scan
 
 
@@ -381,13 +458,21 @@ _RUNINFO_FIELDS = (
 )
 
 
-def fill_missing_pod5_metadata(pod5_dir: str, chemistry: dict) -> int:
+def fill_missing_pod5_metadata(pod5_dir: str, chemistry: dict | None = None,
+                               per_acquisition: dict[str, dict] | None = None) -> int:
     """Fill empty flowcell/kit/sample-rate RunInfo fields in converted pod5.
 
     `pod5 convert fast5` only reads tracking_id, so pod5 files converted
     from older fast5 (flowcell stored only in context_tags/flowcell_type,
     or kit only as experiment_kit) lack the fields dorado needs for
     automatic model selection.  Values already present are never changed.
+
+    per_acquisition maps a pod5 acquisition_id (= the fast5 run_id) to the
+    chemistry detected from that run's own fast5, so an input holding
+    several runs never gets one run's flowcell written into another's
+    reads; acquisitions without an entry are left alone.  A single
+    `chemistry` is only applied when the output holds one acquisition.
+
     Best-effort: a file that cannot be patched is left as written and a
     warning is logged.  Returns the number of files rewritten.
     """
@@ -397,13 +482,33 @@ def fill_missing_pod5_metadata(pod5_dir: str, chemistry: dict) -> int:
     except ImportError:
         logger.warning("pod5 Python package not available; skipping metadata fill")
         return 0
+    files = sorted(Path(pod5_dir).rglob("*.pod5"))
+    if per_acquisition is None:
+        if not chemistry:
+            return 0
+        acquisitions = set()
+        for p5 in files:
+            try:
+                with pod5.Reader(p5) as reader:
+                    acquisitions.update(r.run_info.acquisition_id for r in reader.reads())
+            except Exception:
+                continue
+        if len(acquisitions) > 1:
+            logger.warning("Output holds %d acquisitions but only one chemistry is known; "
+                           "not filling metadata", len(acquisitions))
+            return 0
+        per_acquisition = {acq: chemistry for acq in acquisitions}
+
+    def chem_for(info) -> dict:
+        return per_acquisition.get(info.acquisition_id) or {}
+
     patched_files = 0
-    for p5 in sorted(Path(pod5_dir).rglob("*.pod5")):
+    for p5 in files:
         tmp = p5.with_name(p5.name + ".tmp")
         try:
             with pod5.Reader(p5) as reader:
                 needs = any(
-                    not getattr(rec.run_info, field) and chemistry.get(key)
+                    not getattr(rec.run_info, field) and chem_for(rec.run_info).get(key)
                     for rec in reader.reads()
                     for field, key in _RUNINFO_FIELDS
                 )
@@ -415,10 +520,11 @@ def fill_missing_pod5_metadata(pod5_dir: str, chemistry: dict) -> int:
                     read = rec.to_read()
                     acq = read.run_info.acquisition_id
                     if acq not in patched:
+                        chem = chem_for(read.run_info)
                         updates = {
-                            field: chemistry[key]
+                            field: chem[key]
                             for field, key in _RUNINFO_FIELDS
-                            if not getattr(read.run_info, field) and chemistry.get(key)
+                            if not getattr(read.run_info, field) and chem.get(key)
                         }
                         patched[acq] = dataclasses.replace(read.run_info, **updates)
                     read.run_info = patched[acq]
@@ -487,6 +593,21 @@ def convert_run(
         more = f" (+{len(scan.unreadable) - 5} more)" if len(scan.unreadable) > 5 else ""
         logger.warning("[%s] Skipping %d unreadable/corrupt fast5 file(s): %s%s",
                        run_name, len(scan.unreadable), shown, more)
+    if scan.duplicates:
+        logger.warning("[%s] Skipping %d fast5 file(s) whose reads were already found in "
+                       "other files (duplicate copies), e.g. %s", run_name,
+                       len(scan.duplicates), scan.duplicates[0])
+    if scan.unreadable_dirs:
+        # Unlike a corrupt file, an unreadable folder is usually fixable
+        # (permissions); converting the rest would silently drop its reads.
+        raise ConversionError(
+            f"cannot read {len(scan.unreadable_dirs)} folder(s) under the input, e.g. "
+            f"{scan.unreadable_dirs[0]}; fix permissions and re-run")
+    if scan.partial_duplicates:
+        raise ConversionError(
+            f"{len(scan.partial_duplicates)} multi-read file(s) share only some reads with "
+            f"other files (e.g. {scan.partial_duplicates[0]}); converting would duplicate "
+            f"reads. Remove the overlapping copy and re-run")
     if scan.empty:
         return False
     logger.info("[%s] Found %d single-read and %d multi-read fast5 file(s)%s",
@@ -524,16 +645,17 @@ def convert_run(
 
         _verify_read_count(pod5_partial, scan, run_name)
 
-        chemistry = _detect_chemistry(scan.first_readable())
-        if chemistry:
-            n = fill_missing_pod5_metadata(pod5_partial, chemistry)
-            if n:
-                logger.info(
-                    "[%s] Filled missing pod5 metadata in %d file(s) "
-                    "(flowcell=%s, kit=%s, sample_rate=%s)", run_name, n,
-                    chemistry.get("flowcell"), chemistry.get("kit"),
-                    chemistry.get("sample_rate"),
-                )
+        if scan.run_samples:
+            # One chemistry per run: an input holding several runs (e.g. two
+            # flowcells) never gets one run's flowcell written into another's
+            per_acq = {run_id: chem for run_id, sample in scan.run_samples.items()
+                       if (chem := _detect_chemistry(sample))}
+            n = fill_missing_pod5_metadata(pod5_partial, per_acquisition=per_acq)
+        else:
+            n = fill_missing_pod5_metadata(
+                pod5_partial, chemistry=_detect_chemistry(scan.first_readable()))
+        if n:
+            logger.info("[%s] Filled missing pod5 metadata in %d file(s)", run_name, n)
         Path(pod5_partial, SOURCE_MARKER).write_text(
             str(Path(source or input_dir).resolve()) + "\n")
     except BaseException:
@@ -559,21 +681,35 @@ def convert_run(
 
 
 def _verify_read_count(pod5_dir: str, scan: Fast5Scan, run_name: str) -> None:
-    """Fail unless the pod5 output holds exactly the reads found in the input.
+    """Fail unless the pod5 output holds exactly the reads found in the input,
+    each once (checked by read ID when every input file records its IDs).
 
     Both conversion tools exit 0 after skipping files they cannot handle,
-    so this is the only reliable signal that no reads were lost.
+    so this is the only reliable signal that no reads were lost or doubled.
     """
     if scan.expected_reads is None:
         logger.warning("[%s] h5py unavailable: cannot verify the read count", run_name)
         return
-    got = count_pod5_reads(pod5_dir)
-    if got != scan.expected_reads:
+    import pod5
+    got_ids: list[str] = []
+    for p5 in Path(pod5_dir).rglob("*.pod5"):
+        with pod5.Reader(p5) as reader:
+            got_ids.extend(str(r) for r in reader.read_ids)
+    unique = set(got_ids)
+    if len(unique) != len(got_ids):
         raise ConversionError(
-            f"pod5 output has {got} reads but the input fast5 files contain "
+            f"pod5 output contains {len(got_ids) - len(unique)} duplicated read(s)")
+    if len(got_ids) != scan.expected_reads:
+        raise ConversionError(
+            f"pod5 output has {len(got_ids)} reads but the input fast5 files contain "
             f"{scan.expected_reads}; see the tool warnings above"
         )
-    logger.info("[%s] Verified %d reads in pod5 output", run_name, got)
+    if scan.read_ids is not None and unique != scan.read_ids:
+        missing = len(scan.read_ids - unique)
+        raise ConversionError(
+            f"pod5 output read IDs differ from the input ({missing} input read(s) missing)")
+    logger.info("[%s] Verified %d reads in pod5 output%s", run_name, len(got_ids),
+                " (by read ID)" if scan.read_ids is not None else "")
 
 
 def get_output_name(input_path: str) -> str:
@@ -682,11 +818,14 @@ def main(argv=None):
 
     check_tools()
 
-    # Turn SIGTERM (kill, batch-scheduler time limits) into an exception so
+    # Turn SIGTERM (kill, batch-scheduler time limits), SIGHUP and SIGQUIT into an exception so
     # temp folders are cleaned up and child tools are terminated, as on Ctrl-C.
     def _on_sigterm(signum, frame):
         raise SystemExit(128 + signum)
-    signal.signal(signal.SIGTERM, _on_sigterm)
+    # SIGHUP: the terminal/SSH session closed. The tools run in their own
+    # process group, so without this they would keep running as orphans.
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+        signal.signal(sig, _on_sigterm)
 
     inputs = resolve_inputs(args.input)
     if not inputs:

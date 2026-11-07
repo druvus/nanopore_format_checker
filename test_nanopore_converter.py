@@ -20,49 +20,62 @@ import nanopore_converter
 # keep honest read counts (so read-count verification is exercised).
 # ---------------------------------------------------------------------------
 
-def _single_fast5(path):
+def _single_fast5(path, read_id=None, run_id="run_a"):
+    import uuid
     import h5py
     path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(path, "w") as f:
-        f.create_group("Raw/Reads/Read_1")
-        f.create_group("UniqueGlobalKey/tracking_id")
+        f.create_group("Raw/Reads/Read_1").attrs["read_id"] = str(read_id or uuid.uuid4())
+        f.create_group("UniqueGlobalKey/tracking_id").attrs["run_id"] = run_id
     return path
 
 
-def _multi_fast5(path, n_reads=3):
+def _multi_fast5(path, n_reads=3, read_ids=None, run_id="run_a"):
+    import uuid
     import h5py
     path.parent.mkdir(parents=True, exist_ok=True)
+    ids = read_ids or [str(uuid.uuid4()) for _ in range(n_reads)]
     with h5py.File(path, "w") as f:
         f.attrs["file_type"] = "multi-read"
-        for i in range(n_reads):
-            f.create_group(f"read_{i:08d}-0000-0000-0000-{path.stem[:12]:0>12}")
+        for rid in ids:
+            f.create_group(f"read_{rid}/tracking_id").attrs["run_id"] = run_id
     return path
+
+
+def _read_ids_in(paths):
+    """Read IDs in all fast5 files under the given dirs (follows symlinks)."""
+    import os
+    import h5py
+    ids = []
+    for p in paths:
+        for root, _dirs, files in os.walk(p, followlinks=True):
+            for name in sorted(files):
+                if not name.endswith(".fast5"):
+                    continue
+                with h5py.File(Path(root) / name, "r") as h:
+                    keys = [k[5:] for k in h if k.startswith("read_")]
+                    ids.extend(keys or [h["Raw/Reads/Read_1"].attrs["read_id"]])
+    return [i.decode() if isinstance(i, bytes) else str(i) for i in ids]
 
 
 def _reads_in(paths):
-    """Total reads in all fast5 files under the given dirs (follows symlinks)."""
-    import h5py
-    total = 0
-    for p in paths:
-        for f in Path(p).rglob("*.fast5"):
-            with h5py.File(f, "r") as h:
-                n = sum(1 for k in h if k.startswith("read_"))
-                total += n if n else 1
-    return total
+    return len(_read_ids_in(paths))
 
 
 class FakeTools:
     """Stand-in for nanopore_converter._run.
 
-    single_to_multi_fast5 writes one multi-read file holding one read per
-    input file; pod5 convert writes a real pod5 holding as many reads as its
-    inputs (minus `drop`), refusing to overwrite like the real tool.
+    single_to_multi_fast5 writes one multi-read file holding the input
+    files' reads; pod5 convert writes a real pod5 holding exactly the
+    input reads (minus `drop`, or with `duplicate` extra copies), refusing
+    to overwrite like the real tool.
     """
 
-    def __init__(self, monkeypatch, fail_pod5=False, drop=0):
+    def __init__(self, monkeypatch, fail_pod5=False, drop=0, duplicate=0):
         self.calls = []
         self.fail_pod5 = fail_pod5
         self.drop = drop
+        self.duplicate = duplicate
         monkeypatch.setattr(nanopore_converter, "_run", self)
         monkeypatch.setattr(shutil, "which", lambda cmd: f"/usr/bin/{cmd}")
 
@@ -71,7 +84,7 @@ class FakeTools:
         if cmd[0] == "single_to_multi_fast5":
             src = cmd[cmd.index("-i") + 1]
             save = Path(cmd[cmd.index("-s") + 1])
-            _multi_fast5(save / "batch_0.fast5", _reads_in([src]))
+            _multi_fast5(save / "batch_0.fast5", read_ids=_read_ids_in([src]))
         elif cmd[0] == "pod5":
             if self.fail_pod5:
                 raise subprocess.CalledProcessError(1, label)
@@ -79,7 +92,9 @@ class FakeTools:
             inputs = cmd[3:out_idx]
             out = Path(cmd[out_idx + 1])
             assert not (out / "output.pod5").exists(), "pod5 would refuse to overwrite"
-            _write_pod5(out / "output.pod5", n_reads=_reads_in(inputs) - self.drop)
+            ids = _read_ids_in(inputs)
+            ids = ids[: len(ids) - self.drop] + ids[: self.duplicate]
+            _write_pod5(out / "output.pod5", read_ids=ids)
         return ""
 
 
@@ -620,14 +635,15 @@ def test_run_kills_tool_process_group_when_interrupted(tmp_path):
 # Filling missing pod5 metadata (dorado automatic model selection needs it)
 # ---------------------------------------------------------------------------
 
-def _write_pod5(path, flowcell="", kit="", sample_rate=4000, n_reads=3):
+def _write_pod5(path, flowcell="", kit="", sample_rate=4000, n_reads=3, read_ids=None,
+                acquisition_id="run_a"):
     import uuid
     from datetime import datetime, timezone
     import numpy as np
     import pod5
     now = datetime.now(timezone.utc)
     run_info = pod5.RunInfo(
-        acquisition_id="acq1", acquisition_start_time=now, adc_max=4095, adc_min=-4096,
+        acquisition_id=acquisition_id, acquisition_start_time=now, adc_max=4095, adc_min=-4096,
         context_tags={}, experiment_name="", flow_cell_id="FAK1",
         flow_cell_product_code=flowcell, protocol_name="", protocol_run_id="",
         protocol_start_time=now, sample_id="", sample_rate=sample_rate,
@@ -635,9 +651,9 @@ def _write_pod5(path, flowcell="", kit="", sample_rate=4000, n_reads=3):
         software="", system_name="", system_type="", tracking_id={},
     )
     with pod5.Writer(path) as writer:
-        for _ in range(n_reads):
+        for rid in (read_ids if read_ids is not None else [uuid.uuid4() for _ in range(n_reads)]):
             writer.add_read(pod5.Read(
-                read_id=uuid.uuid4(), pore=pod5.Pore(1, 1, "pore"),
+                read_id=uuid.UUID(str(rid)), pore=pod5.Pore(1, 1, "pore"),
                 calibration=pod5.Calibration(0.0, 1.0), read_number=1,
                 start_sample=0, median_before=200.0,
                 end_reason=pod5.EndReason.from_reason_with_default_forced(
@@ -673,3 +689,163 @@ def test_fill_missing_pod5_metadata_never_raises(tmp_path):
     assert fill_missing_pod5_metadata(str(d), {"flowcell": "FLO-MIN106"}) == 0
     assert (d / "output.pod5").read_bytes() == b"not a pod5 file"
     assert not list(d.glob("*.tmp"))
+
+
+# ---------------------------------------------------------------------------
+# Audit round 3
+# ---------------------------------------------------------------------------
+
+def test_symlinked_folders_are_followed_once(tmp_path, monkeypatch):
+    """Regression: a symlinked fast5_fail/ was silently left out."""
+    import os
+    from nanopore_converter import convert_run, count_pod5_reads
+    FakeTools(monkeypatch)
+    run = tmp_path / "run"
+    for i in range(3):
+        _single_fast5(run / "fast5_pass" / f"r{i}.fast5")
+    _multi_fast5(tmp_path / "otherdisk" / "fast5_fail" / "b.fast5", 4)
+    os.symlink(tmp_path / "otherdisk" / "fast5_fail", run / "fast5_fail")
+    os.symlink(run, run / "loop")  # must not recurse forever or double count
+    assert convert_run(str(run), str(tmp_path / "out")) is True
+    assert count_pod5_reads(str(tmp_path / "out" / "run" / "pod5")) == 7
+
+
+def test_unreadable_folder_fails_the_run(tmp_path, monkeypatch):
+    """Regression: os.walk silently skipped folders it could not list."""
+    import os
+    from nanopore_converter import ConversionError, convert_run
+    FakeTools(monkeypatch)
+    run = tmp_path / "run"
+    _single_fast5(run / "fast5_pass" / "r.fast5")
+    _single_fast5(run / "fast5_fail" / "r.fast5")
+    locked = str(run / "fast5_fail")
+    real_scandir = os.scandir
+
+    def scandir(path="."):
+        if str(path) == locked:
+            raise PermissionError(13, "Permission denied", locked)
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    with pytest.raises(ConversionError, match="cannot read 1 folder"):
+        convert_run(str(run), str(tmp_path / "out"))
+    assert not (tmp_path / "out" / "run" / "pod5").exists()
+
+
+def test_duplicate_copies_are_converted_once(tmp_path, monkeypatch):
+    """Regression: a second copy of the reads passed verification twice."""
+    from nanopore_converter import convert_run
+    FakeTools(monkeypatch)
+    run = tmp_path / "run"
+    ids = []
+    for i in range(4):
+        f = _single_fast5(run / "fast5_pass" / f"r{i}.fast5")
+        ids.append(_read_ids_in([f.parent])[-1])
+    _multi_fast5(run / "backup" / "batch.fast5", read_ids=ids)           # full copy
+    for i in range(2):                                                    # single copies
+        _single_fast5(run / "zz_copy" / f"r{i}.fast5", read_id=ids[i])
+    _multi_fast5(run / ".convert_tmp" / "multi" / "b.fast5", read_ids=ids)  # hidden: ignored
+    assert convert_run(str(run), str(tmp_path / "out")) is True
+    out_ids = _pod5_ids(tmp_path / "out" / "run" / "pod5" / "output.pod5")
+    assert sorted(out_ids) == sorted(ids)
+
+
+def test_partial_duplicate_multi_file_fails(tmp_path, monkeypatch):
+    from nanopore_converter import ConversionError, convert_run
+    FakeTools(monkeypatch)
+    run = tmp_path / "run"
+    f = _single_fast5(run / "a" / "r0.fast5")
+    shared = _read_ids_in([f.parent])[0]
+    _multi_fast5(run / "b" / "batch.fast5", read_ids=[shared, "00000000-0000-0000-0000-000000000001"])
+    with pytest.raises(ConversionError, match="share only some reads"):
+        convert_run(str(run), str(tmp_path / "out"))
+
+
+def test_duplicated_reads_in_output_fail_verification(tmp_path, monkeypatch):
+    from nanopore_converter import ConversionError, convert_run
+    FakeTools(monkeypatch, drop=1, duplicate=1)  # same count, one read doubled
+    _multi_fast5(tmp_path / "run" / "b.fast5", 3)
+    with pytest.raises(ConversionError, match="duplicated"):
+        convert_run(str(tmp_path / "run"), str(tmp_path / "out"))
+
+
+def test_macos_metadata_files_are_ignored(tmp_path, monkeypatch):
+    from nanopore_converter import scan_fast5_dir
+    run = tmp_path / "run"
+    _multi_fast5(run / "fast5_pass" / "batch_0.fast5")
+    (run / "fast5_pass" / "._batch_0.fast5").write_bytes(b"\x00\x05\x16\x07AppleDouble")
+    (run / "__MACOSX" / "fast5_pass").mkdir(parents=True)
+    (run / "__MACOSX" / "fast5_pass" / "._x.fast5").write_bytes(b"junk")
+    scan = scan_fast5_dir(str(run))
+    assert scan.unreadable == [] and len(scan.multi) == 1
+
+
+@pytest.mark.parametrize("suffix,mode", [(".tar.xz", "w:xz"), (".txz", "w:xz"),
+                                         (".tbz2", "w:bz2"), (".tar", "w")])
+def test_every_accepted_archive_suffix_extracts(tmp_path, suffix, mode):
+    """Regression: .tar.xz/.txz/.tbz2 were accepted but 'Unsupported'."""
+    from nanopore_converter import detect_input_type, extract_archive
+    src = _single_fast5(tmp_path / "data" / "r.fast5")
+    archive = tmp_path / f"run{suffix}"
+    with _tarfile.open(archive, mode) as tar:
+        tar.add(src, arcname="run/r.fast5")
+    assert detect_input_type(str(archive)) == "archive"
+    out = extract_archive(str(archive))
+    assert list(Path(out).rglob("*.fast5"))
+    shutil.rmtree(out)
+
+
+def test_metadata_fill_is_per_acquisition(tmp_path):
+    """Regression: one run's flowcell was written into every run's reads."""
+    import pod5
+    from nanopore_converter import fill_missing_pod5_metadata
+    d = tmp_path / "pod5"
+    d.mkdir()
+    _write_pod5(d / "a.pod5", acquisition_id="run_a", n_reads=2)
+    _write_pod5(d / "b.pod5", acquisition_id="run_b", n_reads=2)
+    per_acq = {"run_a": {"flowcell": "FLO-MIN106"}}  # run_b chemistry unknown
+    assert fill_missing_pod5_metadata(str(d), per_acquisition=per_acq) == 1
+    with pod5.Reader(d / "b.pod5") as r:
+        assert {x.run_info.flow_cell_product_code for x in r.reads()} == {""}
+    with pod5.Reader(d / "a.pod5") as r:
+        assert {x.run_info.flow_cell_product_code for x in r.reads()} == {"FLO-MIN106"}
+    # A single chemistry is not applied across several acquisitions
+    assert fill_missing_pod5_metadata(str(d), chemistry={"flowcell": "FLO-MIN111"}) == 0
+
+
+def test_sighup_stops_tools_and_cleans_up(tmp_path):
+    """Regression: closing the terminal left the tools running as orphans."""
+    import os
+    import time
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    for tool in ("single_to_multi_fast5", "pod5"):
+        f = stub / tool
+        f.write_text(f"#!/bin/sh\necho $$ > {tmp_path}/{tool}.pid\nexec sleep 60\n")
+        f.chmod(0o755)
+    _single_fast5(tmp_path / "run" / "r.fast5")
+    env = dict(os.environ, PATH=f"{stub}:{os.environ['PATH']}")
+    proc = subprocess.Popen([sys.executable, str(Path(__file__).parent / "nanopore_converter.py"),
+                             str(tmp_path / "run"), "--output-dir", str(tmp_path / "out")],
+                            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pidfile = tmp_path / "single_to_multi_fast5.pid"
+    for _ in range(100):
+        if pidfile.exists() and pidfile.read_text().strip():
+            break
+        time.sleep(0.1)
+    proc.send_signal(signal.SIGHUP)
+    proc.wait(timeout=20)
+    time.sleep(0.2)
+    tool_pid = int(pidfile.read_text())
+    try:
+        state = Path(f"/proc/{tool_pid}/stat").read_text().split()[2]
+    except FileNotFoundError:
+        state = "gone"
+    assert state in ("gone", "Z"), f"tool still running (state {state})"
+    assert sorted(p.name for p in (tmp_path / "out" / "run").iterdir()) == []
+
+
+def _pod5_ids(path):
+    import pod5
+    with pod5.Reader(path) as r:
+        return [str(i) for i in r.read_ids]

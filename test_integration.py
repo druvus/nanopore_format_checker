@@ -189,3 +189,24 @@ def test_generated_script_with_output_dir_and_relative_paths(tmp_path):
                           text=True, cwd="/")  # run from somewhere else
     assert done.returncode == 0, done.stderr
     assert pod5_reads(tmp_path / "out" / "20230101_multi" / "pod5") == 6
+
+
+
+def test_generated_script_symlinked_folder_and_glob_characters(tmp_path):
+    """Round 3: verification followed symlinks differently from the tools,
+    and pod5 convert globbed '[' in paths."""
+    import os
+    runs = tmp_path / "runs"
+    multi(tmp_path / "otherdisk" / "barcode01", 5, tmp_path)
+    (runs / "20200101_sym" / "fast5_pass").mkdir(parents=True)
+    multi(runs / "20200101_sym" / "fast5_pass", 3, tmp_path, start=100)
+    os.symlink(tmp_path / "otherdisk" / "barcode01", runs / "20200101_sym" / "fast5_pass" / "barcode01")
+    singles(runs / "20200102_run[1]" / "fast5_pass", 4, start=200)
+    script = tmp_path / "c.sh"
+    assert run([CHECKER, runs, "--convert-to", "pod5", "--script-output", script]).returncode == 0
+    res = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert pod5_reads(runs / "20200101_sym" / "pod5_from_fast5") == 8
+    assert pod5_reads(runs / "20200102_run[1]" / "pod5_from_fast5") == 4
+    again = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    assert again.stdout.count("Skipping") == 2
