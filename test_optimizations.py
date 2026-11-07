@@ -672,7 +672,7 @@ def test_generate_conversion_multi_to_pod5(tmp_path: Path) -> None:
     assert "pod5 convert fast5" in script, "Should contain pod5 convert"
     assert "--threads 20" in script, "Should use --threads 20"
     assert "--recursive" in script, "Should use --recursive"
-    assert "pod5 convert fast5 '/data/run/fast5/'" in script, "Should convert the detected fast5 folder"
+    assert "ln -s '/data/run/fast5' \"$stage/0\"" in script, "Should convert the detected fast5 folder"
     assert "single_to_multi_fast5" not in script, "Should NOT contain single_to_multi_fast5"
     print("  PASS: generate_conversion_script multi_read_fast5 -> pod5")
 
@@ -703,7 +703,7 @@ def test_generate_conversion_with_output_dir(tmp_path: Path) -> None:
     # Multi-read output should go to output_dir/run_name/pod5
     assert "/scratch/converted/20240101_run_multi/pod5" in script
     # Input should be the detected fast5 folder, not the whole run
-    assert "pod5 convert fast5 '/readonly/storage/20240101_run_multi/fast5/'" in script
+    assert "ln -s '/readonly/storage/20240101_run_multi/fast5' \"$stage/0\"" in script
     # Single-read intermediates go to the output side, never the read-only input
     assert "/scratch/converted/20240101_run_single/.convert_tmp/multi_fast5" in script
     assert "/readonly/storage/20240101_run_single/.convert_tmp" not in script
@@ -726,7 +726,7 @@ def test_generate_conversion_without_output_dir(tmp_path: Path) -> None:
     }
     script = generate_conversion_script(runs, "pod5")
     assert "mv '/data/20240101_run_multi/.convert_tmp/pod5' '/data/20240101_run_multi/pod5_from_fast5'" in script
-    assert "pod5 convert fast5 '/data/20240101_run_multi/fast5/'" in script
+    assert "ln -s '/data/20240101_run_multi/fast5' \"$stage/0\"" in script
     print("  PASS: generate_conversion_script without --output-dir")
 
 
@@ -1370,7 +1370,7 @@ def test_conversion_script_quoting_and_archives(tmp_path: Path) -> None:
         },
     }
     script = generate_conversion_script(runs, "pod5")
-    assert "'/data/20240101_it'\"'\"'s_run/'" in script, script
+    assert "ln -s '/data/20240101_it'\"'\"'s_run' \"$stage/0\"" in script, script
     assert "SKIPPED 20240101_archived" in script
     assert "single_to_multi_fast5" not in script
     check = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
@@ -1551,9 +1551,11 @@ def test_script_is_rerunnable_and_isolates_failures(tmp_path: Path) -> None:
     script = _script_for(tmp_path)
     run = str(tmp_path / "20240101_run")
     # Skips runs that are already converted
-    assert f"if compgen -G '{run}/pod5_from_fast5''/*.pod5' > /dev/null; then" in script
+    assert f"if find '{run}/pod5_from_fast5' -maxdepth 1 -name '*.pod5'" in script
     # Converts only the detected folders, into a work dir moved into place
-    assert f"pod5 convert fast5 '{run}/fast5_pass/' '{run}/fast5_fail/' --output '{run}/.convert_tmp/pod5/'" in script
+    assert f"ln -s '{run}/fast5_pass' \"$stage/0\"" in script
+    assert f"ln -s '{run}/fast5_fail' \"$stage/1\"" in script
+    assert f"""pod5 convert fast5 "$stage/0/" "$stage/1/" --output '{run}/.convert_tmp/pod5/'""" in script
     assert f"mv '{run}/.convert_tmp/pod5' '{run}/pod5_from_fast5'" in script
     # Read-count verification runs before the output is published
     assert script.index("VERIFY_EOF") < script.index("mv '")
@@ -1599,8 +1601,8 @@ def test_single_fast5_outputs_per_input_folder(tmp_path: Path) -> None:
         "details": {"multi_read_fast5": {"directories": [
             "/d/20240101_run/fast5_pass", "/d/20240101_run/fast5_fail"]}}}}
     script = generate_conversion_script(runs, "single_fast5")
-    assert "--save_path '/d/20240101_run/single_fast5/fast5_pass'" in script
-    assert "--save_path '/d/20240101_run/single_fast5/fast5_fail'" in script
+    assert "--save_path '/d/20240101_run/single_from_fast5/from__fast5_pass'" in script
+    assert "--save_path '/d/20240101_run/single_from_fast5/from__fast5_fail'" in script
     print("  PASS: single_fast5 output per input folder")
 
 
@@ -1629,6 +1631,116 @@ def test_dorado_advice_is_runnable(tmp_path: Path) -> None:
     lines = "\n".join(dorado_advice_lines(r10, ["multi_read_fast5"]))
     assert "dorado >=1.0 cannot read fast5" in lines and "dorado download" not in lines
     print("  PASS: dorado advice is runnable")
+
+
+
+# ---------------------------------------------------------------------------
+# Audit round 3
+# ---------------------------------------------------------------------------
+
+def test_counts_follow_symlinked_files_and_folders(tmp_path: Path) -> None:
+    from nanopore_format_checker import _find_first_pod5
+    store = tmp_path / "store"
+    make_file(store / "a.fast5", size=100)
+    make_file(store / "sub" / "b.fast5", size=100)
+    make_file(store / "c.pod5", size=50)
+    d = tmp_path / "fast5_pass"
+    d.mkdir()
+    os.symlink(store / "a.fast5", d / "a.fast5")
+    os.symlink(store / "sub", d / "barcode01")
+    os.symlink(d, d / "loop")  # loop guard
+    assert fast_count_files(d, ".fast5", recursive=True) == (2, 200)
+    assert estimate_dir_size(d, ".fast5", recursive=True)[:2] == (2, 200)
+    p = tmp_path / "pod5"
+    p.mkdir()
+    os.symlink(store / "c.pod5", p / "c.pod5")
+    assert _find_first_pod5(p) == p / "c.pod5"
+    print("  PASS: counts follow symlinks")
+
+
+def test_unreadable_extra_folder_is_not_permission_denied(tmp_path: Path) -> None:
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        print("  SKIP: unreadable extra folder (root bypasses permissions)")
+        return
+    run = tmp_path / "20240101_run_rootfiles"
+    _make_single_read_fast5(run / "r1.fast5")
+    (run / "logs").mkdir()
+    (run / "logs").chmod(0)
+    try:
+        assert analyze_run(run)["formats"] == ["single_read_fast5"]
+    finally:
+        (run / "logs").chmod(0o755)
+    print("  PASS: unreadable extra folder is not permission_denied")
+
+
+def test_single_fast5_output_is_separate_and_not_redetected(tmp_path: Path) -> None:
+    run = tmp_path / "20240101_two"
+    for sample in ("sampleA", "sampleB"):
+        _make_multi_read_fast5(run / sample / "fast5_pass" / "batch_0.fast5")
+    info = analyze_run(run)
+    script = generate_conversion_script({run.name: info}, "single_fast5")
+    for sample in ("sampleA", "sampleB"):
+        assert f"single_from_fast5/from__{sample}__fast5_pass'" in script
+    # simulate the output: single-read files under single_from_fast5/from__...
+    _make_single_read_fast5(run / "single_from_fast5" / "from__sampleA__fast5_pass" / "0" / "r.fast5")
+    again = analyze_run(run)
+    assert again["formats"] == ["multi_read_fast5"], again["formats"]
+    assert len(again["details"]["multi_read_fast5"]["directories"]) == 2
+    print("  PASS: single_fast5 output separate and not re-detected")
+
+
+def test_newline_in_run_name_cannot_inject_commands(tmp_path: Path) -> None:
+    import subprocess
+    name = "20240101_x\ntouch PWNED; #"
+    run = tmp_path / name
+    (run / "fast5_pass").mkdir(parents=True)
+    runs = {name: {"formats": ["multi_read_fast5"], "run_path": str(run),
+                   "details": {"multi_read_fast5": {"directories": [str(run / "fast5_pass")]}}},
+            "20240101_arch\nrm -rf x": {"formats": ["single_read_fast5"],
+                                        "details": {"single_read_fast5": {"archive_files": ["a.tar"]}}}}
+    script = generate_conversion_script(runs, "pod5")
+    res = subprocess.run(["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True,
+                         env={"PATH": "/usr/bin:/bin"})
+    assert not (tmp_path / "PWNED").exists()
+    assert res.returncode == 1 and "1 run(s) failed" in res.stderr  # tools missing, not a syntax error
+    print("  PASS: newline in run name cannot inject commands")
+
+
+def test_glob_characters_in_paths(tmp_path: Path) -> None:
+    """compgen -G treated [..] as a pattern, so finished runs were redone."""
+    import subprocess
+    run = tmp_path / "20240101_run[1]"
+    (run / "fast5_pass").mkdir(parents=True)
+    make_file(run / "pod5_from_fast5" / "x.pod5", size=10)
+    runs = {run.name: {"formats": ["multi_read_fast5"], "run_path": str(run),
+                       "details": {"multi_read_fast5": {"directories": [str(run / "fast5_pass")]}}}}
+    script = generate_conversion_script(runs, "pod5")
+    res = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                         env={"PATH": "/usr/bin:/bin"})
+    assert res.returncode == 0 and "Skipping 20240101_run[1]" in res.stdout, res.stdout + res.stderr
+    print("  PASS: glob characters in paths")
+
+
+def test_output_dir_inside_runs_is_refused(tmp_path: Path) -> None:
+    import subprocess
+    target = tmp_path / "runs"
+    _make_multi_read_fast5(target / "20240101_run" / "fast5_pass" / "batch_0.fast5")
+    make_file(target / "20240101_run" / "pod5" / "minknow.pod5", size=10)
+    script = Path(__file__).parent / "nanopore_format_checker.py"
+    for out in (target, target / "20240101_run" / "converted"):
+        res = subprocess.run([sys.executable, str(script), str(target), "--convert-to", "pod5",
+                              "--output-dir", str(out), "--script-output", str(tmp_path / "c.sh")],
+                             capture_output=True, text=True)
+        assert res.returncode == 2 and "inside run folder" in res.stderr, res.stderr
+    print("  PASS: output dir inside runs refused")
+
+
+def test_fast5_unknown_runs_get_a_skipped_comment(tmp_path: Path) -> None:
+    runs = {"20240101_empty": {"formats": ["fast5_unknown"], "run_path": "/d/20240101_empty",
+                               "details": {"fast5_unknown": {"directories": ["/d/x/fast5_pass"]}}}}
+    assert "# SKIPPED 20240101_empty: fast5 format could not be determined" in \
+        generate_conversion_script(runs, "pod5")
+    print("  PASS: fast5_unknown SKIPPED comment")
 
 
 def main():
@@ -1731,6 +1843,13 @@ def main():
         test_single_fast5_outputs_per_input_folder,
         test_hidden_work_folders_are_not_run_data,
         test_dorado_advice_is_runnable,
+        test_counts_follow_symlinked_files_and_folders,
+        test_unreadable_extra_folder_is_not_permission_denied,
+        test_single_fast5_output_is_separate_and_not_redetected,
+        test_newline_in_run_name_cannot_inject_commands,
+        test_glob_characters_in_paths,
+        test_output_dir_inside_runs_is_refused,
+        test_fast5_unknown_runs_get_a_skipped_comment,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:
