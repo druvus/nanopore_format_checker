@@ -283,3 +283,65 @@ def test_cancel_stops_recompress_and_copy_quietly(tmp_path, worker, caplog):
     assert not dest.exists() and list(out.iterdir()) == []
     assert progress.errors == 0
     assert "cancelled: in.tar" in caplog.text and "Traceback" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Audit round 4
+# ---------------------------------------------------------------------------
+
+def test_many_unreadable_files_stay_linear(tmp_path, monkeypatch):
+    """Regression: each unreadable file scanned all of tar.inodes (quadratic)."""
+    import time
+    src = tmp_path / "run"
+    (src / "a_ok").mkdir(parents=True)
+    (src / "z_locked").mkdir()
+    # tarfile only tracks inodes of hard-linked files (st_nlink > 1), so give
+    # every file a second link outside the archived tree.
+    (tmp_path / "links").mkdir()
+    # unreadable files come after the readable ones (sorted order)
+    for sub, n in (("a_ok", 20000), ("z_locked", 10000)):
+        for i in range(n):
+            f = src / sub / f"f{i}"
+            f.write_bytes(b"x")
+            os.link(f, tmp_path / "links" / f"{sub}{i}")
+
+    def fake_open(path, *a, **k):
+        if "/z_locked/" in str(path):
+            raise PermissionError(13, "denied", path)
+        return open(path, *a, **k)
+
+    monkeypatch.setattr(cf, "open", fake_open, raising=False)
+    start = time.perf_counter()
+    progress = _compress(src, tmp_path / "out")
+    assert progress._permission_warnings == 10000
+    assert time.perf_counter() - start < 15  # quadratic version: >20 s
+
+
+def test_symlink_loop_at_top_level_is_skipped(tmp_path):
+    src = tmp_path / "in"
+    (src / "run1").mkdir(parents=True)
+    os.symlink("loop", src / "loop")  # self-referencing
+    assert cf.process(src, tmp_path / "out", dry_run=False, workers=1) == 0
+    assert (tmp_path / "out" / "run1.tar.gz").exists()
+
+
+def test_sigterm_cleans_up_like_ctrl_c(tmp_path):
+    """Regression: SIGTERM left .tmp files in the output."""
+    import signal as _signal
+    import subprocess
+    import sys
+    import time
+    src = tmp_path / "in" / "big"
+    src.mkdir(parents=True)
+    for i in range(40):
+        (src / f"f{i}").write_bytes(os.urandom(2_000_000))
+    out = tmp_path / "out"
+    proc = subprocess.Popen([sys.executable, str(Path(cf.__file__)), str(tmp_path / "in"), str(out)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(100):
+        if out.exists() and any(p.name.endswith(".tmp") for p in out.iterdir()):
+            break
+        time.sleep(0.05)
+    proc.send_signal(_signal.SIGTERM)
+    assert proc.wait(timeout=30) == 130
+    assert not [p for p in out.iterdir() if p.name.endswith(".tmp")]
