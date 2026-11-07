@@ -36,10 +36,10 @@ python nanopore_converter.py input_list.txt --output-dir /scratch/converted --th
 ### Tests
 
 ```bash
-python test_optimizations.py          # format checker tests (94 tests)
-python -m pytest test_nanopore_converter.py -v  # converter tests (46 tests)
-python -m pytest test_compress_folders.py -v    # archiver tests (12; two are skipped when run as root)
-python -m pytest test_integration.py -v         # real pod5/single_to_multi_fast5 end-to-end (5; skipped without the tools)
+python test_optimizations.py          # format checker tests (101 tests)
+python -m pytest test_nanopore_converter.py -v  # converter tests (58 tests)
+python -m pytest test_compress_folders.py -v    # archiver tests (15; two are skipped when run as root)
+python -m pytest test_integration.py -v         # real pod5/single_to_multi_fast5 end-to-end (6; skipped without the tools)
 ```
 
 ### Format checker CLI flags
@@ -123,12 +123,12 @@ Single script that orchestrates format conversion via subprocess calls. Key func
 - `extract_archive()` - Extracts compressed archives to a temp directory (tar uses the `data` extraction filter to block path traversal); caller handles cleanup
 - `parse_list_file()` - Reads a text file of paths (one per line, skips blanks and `#` comments)
 - `resolve_inputs()` - Resolves the input argument to a flat list of paths to process
-- `scan_fast5_dir()` - Opens every `.fast5` with h5py and groups it as single-read, multi-read (with read count) or unreadable; `expected_reads` drives verification. `classify_fast5_dir()` summarises it (`mixed_fast5` possible)
+- `scan_fast5_dir()` - Opens every `.fast5` with h5py and groups it as single-read, multi-read or unreadable, collecting read IDs (duplicates of already-seen reads are skipped; partly overlapping multi-read files are `partial_duplicates`) and one sample file per `run_id`. Follows symlinked folders (loop guard), skips hidden folders / `._*` / `__MACOSX`, records unlistable folders in `unreadable_dirs` (the run then fails). `_verify_read_count()` checks the output's read IDs equal the input's, each once. `classify_fast5_dir()` summarises it (`mixed_fast5` possible)
 - `_run()` - Runs a tool in its own process group, logs problem lines from stderr at WARNING even on exit 0, kills the whole group on interrupt
 - `convert_run()` - Core conversion: stages single-read files (symlinks) for `single_to_multi_fast5` and multi-read files for `pod5 convert fast5` (a run may contain both), then `_verify_read_count()` requires the pod5 output to hold exactly `expected_reads` (raises `ConversionError`). Unreadable files are skipped and reported (`SKIPPED_UNREADABLE`, repeated in the summary). Writes `pod5/.source`. Writes into `<run>/.pod5_partial/` and swaps it into `<run>/pod5/` only on success (old output is renamed aside, then deleted); clears leftovers from interrupted runs; always removes the intermediate `_multi_fast5_tmp/`
-- `fill_missing_pod5_metadata()` - After conversion, fills empty `flow_cell_product_code` / `sequencing_kit` / `sample_rate` in pod5 RunInfo from the source fast5 (via the checker's `extract_chemistry_fast5`); never overwrites, never fails the conversion
+- `fill_missing_pod5_metadata()` - Per acquisition (pod5 `acquisition_id` = fast5 `run_id`; chemistry from that run's own sample file; a single chemistry is never applied across several acquisitions). After conversion, fills empty `flow_cell_product_code` / `sequencing_kit` / `sample_rate` in pod5 RunInfo from the source fast5 (via the checker's `extract_chemistry_fast5`); never overwrites, never fails the conversion
 - `get_output_name()` - Derives output folder name from the resolved input path, stripping archive extensions
-- `is_converted()` / `converted_source()` / `_overlap_problem()` - `main()` skips converted inputs unless `--force`, refuses output converted from a different source (`pod5/.source`), refuses output on top of the input, dedupes resolved inputs, and fails duplicate output names within one invocation. SIGTERM is turned into `SystemExit` so cleanup runs
+- `is_converted()` / `converted_source()` / `_overlap_problem()` - `main()` skips converted inputs unless `--force`, refuses output converted from a different source (`pod5/.source`), refuses output on top of the input, dedupes resolved inputs, and fails duplicate output names within one invocation. SIGTERM/SIGHUP/SIGQUIT are turned into `SystemExit` so cleanup runs
 - `parse_list_file()` resolves relative entries against the list file's folder and expands `~`
 - `process_item()` - Orchestrates one input item (directory or archive) with try/except/finally cleanup of temp directories
 - `main()` - Entry point: parses args, checks tools, resolves inputs, iterates over items, tracks success/failure counts
@@ -154,6 +154,9 @@ Output structure: `<output-dir>/<input_basename>/pod5/*.pod5`. A `pod5/` folder 
 - Never trust a conversion tool's exit code alone: `pod5 convert` and `single_to_multi_fast5` exit 0 after skipping files they cannot handle. Verify read counts (converter: `_verify_read_count`; scripts: embedded check)
 - `pod5 convert --output DIR/` writes a *file* named DIR if the folder does not exist; always create the output folder first
 - Hidden folders (starting with `.`) are work folders and never run data
+- Follow symlinked folders everywhere data is found, counted or verified (with a realpath loop guard): the conversion tools follow them, so any code that does not will disagree with them
+- Text written into generated bash comments goes through `_comment_safe()`; pod5 globs `[ ] * ?` in input paths, so scripts pass inputs through symlinks in a `mktemp -d` stage folder
+- `--convert-to single_fast5` output goes to `single_from_fast5/from__<path>`: never name output folders so they match detection patterns (`fast5*`, `pod5*`, `fastq*`) unless re-detection is intended (`pod5_from_fast5` is)
 - Tests must not depend on `os.scandir` order; `test_optimizations.py`'s runner gives each test its own directory
 - File counting uses `os.scandir` instead of `Path.rglob` for performance on large directories
 - The 1 MB threshold for single vs multi-read fast5 classification is only a fallback heuristic (single-read: typically 1-50 KB; multi-read: typically 1+ MB, but small multi-read files exist, e.g. in `fast5_fail/`)
