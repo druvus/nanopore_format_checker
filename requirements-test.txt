@@ -1,4 +1,5 @@
-# Test dependencies (CI). The converter's external CLI tools are mocked in tests.
+# Test dependencies (CI). The real conversion tools for test_integration.py
+# are installed separately in the workflow (ont_fast5_api needs --no-deps).
 h5py
 pod5
 pytest

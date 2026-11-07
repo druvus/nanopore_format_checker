@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import uuid
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -231,37 +232,60 @@ def _decode(value) -> str:
 @dataclass
 class Fast5Info:
     kind: str                 # "single" or "multi"
-    read_ids: list[str]       # empty if the file does not record them
-    run_id: str | None        # tracking_id/run_id (= pod5 acquisition_id)
+    read_ids: list[str]       # every read in the file
+    run_ids: list[str]        # tracking_id/run_id values seen (= pod5 acquisition_id)
+
+
+def _read_id_key(read_id: str) -> bytes:
+    """Compact set key for a read ID: 16 bytes for a UUID (most are) instead
+    of a ~90-byte str, so a 20M-read run needs ~1 GB less memory."""
+    try:
+        return uuid.UUID(read_id).bytes
+    except ValueError:
+        return read_id.encode()
 
 
 def _inspect_fast5(fpath: Path) -> Fast5Info | None:
-    """Read a fast5 file's layout, read IDs and run ID; None if it cannot be
-    opened or has neither the single- nor the multi-read layout."""
+    """Read a fast5 file's layout, read IDs and run IDs.
+
+    Returns None for files the conversion tools cannot convert, so they are
+    reported and skipped rather than making the tools abort a whole batch:
+    unopenable/corrupt files, single-read files without a read_id, Signal,
+    channel_id or run_id (left by crashes or very old event-only software),
+    and multi-read files whose reads have no Raw/Signal.  An empty
+    multi-read file is returned with no reads.
+    """
+    def run_id_of(group) -> str | None:
+        try:
+            return _decode(group["tracking_id"].attrs["run_id"])
+        except Exception:
+            return None
+
     try:
         with h5py.File(fpath, "r") as f:
             keys = [k for k in f if k.startswith("read_")]
             if keys:
-                run_id = None
-                try:
-                    run_id = _decode(f[keys[0]]["tracking_id"].attrs["run_id"])
-                except Exception:
-                    pass
-                return Fast5Info("multi", [k[len("read_"):] for k in keys], run_id)
+                # Several runs merged into one file are rare; checking the
+                # first and last read catches the common merge without
+                # reading every read group's attributes.
+                ends = [keys[0], keys[-1]] if len(keys) > 1 else keys
+                if not all("Raw/Signal" in f[k] for k in ends):
+                    return None
+                run_ids = sorted({r for r in (run_id_of(f[k]) for k in ends) if r})
+                return Fast5Info("multi", [k[len("read_"):] for k in keys], run_ids)
             if "Raw" in f or "UniqueGlobalKey" in f:
-                read_ids = []
-                try:
-                    for read in f["Raw/Reads"].values():
-                        if "read_id" in read.attrs:
-                            read_ids.append(_decode(read.attrs["read_id"]))
-                except Exception:
-                    pass
-                run_id = None
-                try:
-                    run_id = _decode(f["UniqueGlobalKey/tracking_id"].attrs["run_id"])
-                except Exception:
-                    pass
-                return Fast5Info("single", read_ids[:1], run_id)
+                reads = list(f["Raw/Reads"].values())
+                if len(reads) != 1 or "read_id" not in reads[0].attrs or "Signal" not in reads[0]:
+                    return None
+                if "channel_id" not in f["UniqueGlobalKey"]:
+                    return None
+                run_id = run_id_of(f["UniqueGlobalKey"])
+                if not run_id:
+                    return None
+                return Fast5Info("single", [_decode(reads[0].attrs["read_id"])], [run_id])
+            ft = f.attrs.get("file_type")
+            if ft is not None and _decode(ft).lower().startswith("multi"):
+                return Fast5Info("multi", [], [])
     except Exception:
         return None
     return None
@@ -278,7 +302,7 @@ class Fast5Scan:
     partial_duplicates: list[Path] = field(default_factory=list)
     expected_reads: int | None = 0  # None when reads could not be counted
     # Read IDs of every converted file, when all files record them
-    read_ids: set[str] | None = field(default_factory=set)
+    read_ids: set[bytes] | None = field(default_factory=set)  # _read_id_key() values
     # One readable sample file per run_id (for per-acquisition metadata)
     run_samples: dict[str, Path] = field(default_factory=dict)
 
@@ -353,21 +377,21 @@ def scan_fast5_dir(dir_path: str, exclude: list[str] | None = None) -> Fast5Scan
             if info is None:
                 scan.unreadable.append(fpath)
                 continue
-            n_reads = len(info.read_ids) if info.kind == "multi" else 1
+            n_reads = len(info.read_ids)
+            if n_reads == 0:  # empty multi-read file: nothing to convert
+                continue
+            keys = [_read_id_key(r) for r in info.read_ids]
             if scan.read_ids is not None:
-                if info.read_ids:
-                    seen = [r for r in info.read_ids if r in scan.read_ids]
-                    if seen and len(seen) == len(info.read_ids):
-                        scan.duplicates.append(fpath)
-                        continue
-                    if seen:
-                        scan.partial_duplicates.append(fpath)
-                        continue
-                    scan.read_ids.update(info.read_ids)
-                else:
-                    scan.read_ids = None  # cannot verify by ID; fall back to counts
-            if info.run_id and info.run_id not in scan.run_samples:
-                scan.run_samples[info.run_id] = fpath
+                seen = sum(1 for k in keys if k in scan.read_ids)
+                if seen == len(keys):
+                    scan.duplicates.append(fpath)
+                    continue
+                if seen:
+                    scan.partial_duplicates.append(fpath)
+                    continue
+                scan.read_ids.update(keys)
+            for run_id in info.run_ids:
+                scan.run_samples.setdefault(run_id, fpath)
             (scan.single if info.kind == "single" else scan.multi).append(fpath)
             scan.expected_reads += n_reads
     return scan
@@ -391,7 +415,9 @@ def _stage(files: list[Path], directory: str) -> None:
     untouched) so each conversion tool sees exactly the files meant for it."""
     os.makedirs(directory)
     for i, src in enumerate(files):
-        os.symlink(os.path.abspath(src), os.path.join(directory, f"{i:07d}_{src.name}"))
+        # Neutral names: the tools match a lower-case ".fast5" suffix, and a
+        # long original name plus a prefix could exceed NAME_MAX.
+        os.symlink(os.path.abspath(src), os.path.join(directory, f"{i:07d}.fast5"))
 
 
 _TOOL_PROBLEM = re.compile(r"error|warning|failed|not a|cannot|could not|exception", re.I)
@@ -691,24 +717,32 @@ def _verify_read_count(pod5_dir: str, scan: Fast5Scan, run_name: str) -> None:
         logger.warning("[%s] h5py unavailable: cannot verify the read count", run_name)
         return
     import pod5
-    got_ids: list[str] = []
+    # Stream the output IDs against the expected set, removing each one as it
+    # is seen: no list or second set of IDs (memory scales with read count).
+    remaining = scan.read_ids
+    got = extra = 0
     for p5 in Path(pod5_dir).rglob("*.pod5"):
         with pod5.Reader(p5) as reader:
-            got_ids.extend(str(r) for r in reader.read_ids)
-    unique = set(got_ids)
-    if len(unique) != len(got_ids):
+            for rid in reader.read_ids:
+                got += 1
+                if remaining is not None:
+                    key = _read_id_key(str(rid))
+                    if key in remaining:
+                        remaining.discard(key)
+                    else:
+                        extra += 1  # duplicated, or not from this input
+    if remaining is not None and extra:
         raise ConversionError(
-            f"pod5 output contains {len(got_ids) - len(unique)} duplicated read(s)")
-    if len(got_ids) != scan.expected_reads:
+            f"pod5 output contains {extra} duplicated or unexpected read(s)")
+    if got != scan.expected_reads:
         raise ConversionError(
-            f"pod5 output has {len(got_ids)} reads but the input fast5 files contain "
+            f"pod5 output has {got} reads but the input fast5 files contain "
             f"{scan.expected_reads}; see the tool warnings above"
         )
-    if scan.read_ids is not None and unique != scan.read_ids:
-        missing = len(scan.read_ids - unique)
+    if remaining:
         raise ConversionError(
-            f"pod5 output read IDs differ from the input ({missing} input read(s) missing)")
-    logger.info("[%s] Verified %d reads in pod5 output%s", run_name, len(got_ids),
+            f"pod5 output read IDs differ from the input ({len(remaining)} input read(s) missing)")
+    logger.info("[%s] Verified %d reads in pod5 output%s", run_name, got,
                 " (by read ID)" if scan.read_ids is not None else "")
 
 
@@ -825,7 +859,10 @@ def main(argv=None):
     # SIGHUP: the terminal/SSH session closed. The tools run in their own
     # process group, so without this they would keep running as orphans.
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
-        signal.signal(sig, _on_sigterm)
+        # Leave ignored signals ignored: `nohup` sets SIGHUP to SIG_IGN so a
+        # long conversion survives logging out.
+        if signal.getsignal(sig) is not signal.SIG_IGN:
+            signal.signal(sig, _on_sigterm)
 
     inputs = resolve_inputs(args.input)
     if not inputs:
@@ -840,7 +877,12 @@ def main(argv=None):
     seen_names: dict[str, str] = {}
     seen_paths: set[Path] = set()
     for item in inputs:
-        resolved = Path(item).resolve()
+        try:
+            resolved = Path(item).resolve()
+        except (OSError, RuntimeError) as e:  # e.g. symlink loop
+            logger.error("Cannot resolve %s: %s", item, e)
+            failed += 1
+            continue
         if resolved in seen_paths:
             logger.warning("Skipping duplicate entry: %s", item)
             continue

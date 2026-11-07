@@ -210,3 +210,39 @@ def test_generated_script_symlinked_folder_and_glob_characters(tmp_path):
     assert pod5_reads(runs / "20200102_run[1]" / "pod5_from_fast5") == 4
     again = subprocess.run(["bash", str(script)], capture_output=True, text=True)
     assert again.stdout.count("Skipping") == 2
+
+
+
+@pytest.mark.skipif(not shutil.which("multi_to_single_fast5"), reason="needs multi_to_single_fast5")
+def test_generated_single_fast5_script_verifies_and_reruns(tmp_path):
+    runs = tmp_path / "runs"
+    multi(runs / "20200102_pf" / "fast5_pass", 5, tmp_path)
+    multi(runs / "20200102_pf" / "fast5_fail", 3, tmp_path, start=30)
+    script = tmp_path / "s.sh"
+    assert run([CHECKER, runs, "--convert-to", "single_fast5", "--script-output", script]).returncode == 0
+    first = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "Verified 5 reads" in first.stdout and "Verified 3 reads" in first.stdout
+    second = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    assert second.stdout.count("Skipping") == 2
+    rerun = run([CHECKER, runs])
+    assert "multi_read_fast5" in rerun.stdout and "single_read_fast5" not in rerun.stdout
+
+
+@pytest.mark.skipif(hasattr(__import__("os"), "geteuid") and __import__("os").geteuid() == 0,
+                    reason="root bypasses file permissions")
+def test_generated_script_fails_on_unreadable_folder(tmp_path):
+    """Round 4: an unreadable fast5_fail/ was skipped and the run 'Verified'."""
+    runs = tmp_path / "runs"
+    multi(runs / "20200101_perm" / "fast5_pass", 6, tmp_path)
+    multi(runs / "20200101_perm" / "fast5_fail", 4, tmp_path, start=50)
+    locked = runs / "20200101_perm" / "fast5_fail"
+    script = tmp_path / "c.sh"
+    locked.chmod(0)
+    try:
+        assert run([CHECKER, runs, "--convert-to", "pod5", "--script-output", script]).returncode == 0
+        res = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    finally:
+        locked.chmod(0o755)
+    assert res.returncode == 1 and "permission denied" in res.stdout, res.stdout
+    assert not (runs / "20200101_perm" / "pod5_from_fast5").exists()

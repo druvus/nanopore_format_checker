@@ -25,8 +25,11 @@ def _single_fast5(path, read_id=None, run_id="run_a"):
     import h5py
     path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(path, "w") as f:
-        f.create_group("Raw/Reads/Read_1").attrs["read_id"] = str(read_id or uuid.uuid4())
+        read = f.create_group("Raw/Reads/Read_1")
+        read.attrs["read_id"] = str(read_id or uuid.uuid4())
+        read.create_dataset("Signal", data=[1, 2, 3])
         f.create_group("UniqueGlobalKey/tracking_id").attrs["run_id"] = run_id
+        f.create_group("UniqueGlobalKey/channel_id")
     return path
 
 
@@ -39,6 +42,7 @@ def _multi_fast5(path, n_reads=3, read_ids=None, run_id="run_a"):
         f.attrs["file_type"] = "multi-read"
         for rid in ids:
             f.create_group(f"read_{rid}/tracking_id").attrs["run_id"] = run_id
+            f.create_dataset(f"read_{rid}/Raw/Signal", data=[1, 2, 3])
     return path
 
 
@@ -341,7 +345,7 @@ def test_classify_small_multi_read_by_structure(tmp_path):
     d.mkdir()
     with h5py.File(d / "batch_0.fast5", "w") as f:
         f.attrs["file_type"] = "multi-read"
-        f.create_group("read_00000000-0000-0000-0000-000000000000")
+        f.create_dataset("read_00000000-0000-0000-0000-000000000000/Raw/Signal", data=[1])
     assert (d / "batch_0.fast5").stat().st_size < 1_000_000
     assert classify_fast5_dir(str(d)) == "multi_read_fast5"
 
@@ -849,3 +853,83 @@ def _pod5_ids(path):
     import pod5
     with pod5.Reader(path) as r:
         return [str(i) for i in r.read_ids]
+
+
+# ---------------------------------------------------------------------------
+# Audit round 4
+# ---------------------------------------------------------------------------
+
+def test_unconvertible_files_are_skipped_not_fatal(tmp_path, monkeypatch):
+    """Regression: one file without read_id/Signal made the tool abort a batch
+    and failed the whole run ('1 reads but ... 5')."""
+    import h5py
+    from nanopore_converter import convert_run, scan_fast5_dir
+    run = tmp_path / "run"
+    for i in range(3):
+        _single_fast5(run / f"good{i}.fast5")
+    no_id = _single_fast5(run / "no_id.fast5")
+    with h5py.File(no_id, "a") as f:
+        del f["Raw/Reads/Read_1"].attrs["read_id"]
+    no_signal = _single_fast5(run / "no_signal.fast5")
+    with h5py.File(no_signal, "a") as f:
+        del f["Raw/Reads/Read_1/Signal"]
+    no_raw = _multi_fast5(run / "multi_no_signal.fast5", 2)
+    with h5py.File(no_raw, "a") as f:
+        for k in list(f):
+            del f[k]["Raw"]
+    empty = run / "empty_multi.fast5"
+    with h5py.File(empty, "w") as f:
+        f.attrs["file_type"] = "multi-read"
+    scan = scan_fast5_dir(str(run))
+    assert sorted(p.name for p in scan.unreadable) == [
+        "multi_no_signal.fast5", "no_id.fast5", "no_signal.fast5"]  # empty_multi: just no reads
+    assert scan.expected_reads == 3 and scan.read_ids is not None
+    FakeTools(monkeypatch)
+    assert convert_run(str(run), str(tmp_path / "out")) is True
+
+
+def test_stage_names_are_neutral(tmp_path):
+    """Regression: .FAST5 was ignored by the tools; long names hit NAME_MAX."""
+    import os
+    from nanopore_converter import _stage
+    src = [_single_fast5(tmp_path / "READ.FAST5"), _single_fast5(tmp_path / ("x" * 240 + ".fast5"))]
+    _stage(src, str(tmp_path / "stage"))
+    assert sorted(os.listdir(tmp_path / "stage")) == ["0000000.fast5", "0000001.fast5"]
+
+
+def test_multi_read_file_from_two_runs_records_both(tmp_path):
+    import uuid
+    import h5py
+    from nanopore_converter import scan_fast5_dir
+    f = tmp_path / "run" / "merged.fast5"
+    f.parent.mkdir()
+    with h5py.File(f, "w") as h:
+        for rid, run_id in ((uuid.uuid4(), "run_a"), (uuid.uuid4(), "run_b")):
+            h.create_group(f"read_{rid}/tracking_id").attrs["run_id"] = run_id
+            h.create_dataset(f"read_{rid}/Raw/Signal", data=[1])
+    assert sorted(scan_fast5_dir(str(tmp_path / "run")).run_samples) == ["run_a", "run_b"]
+
+
+def test_nohup_is_respected(tmp_path):
+    """Regression: the SIGHUP handler overrode nohup, so logging out killed it."""
+    import os
+    import time
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    for tool in ("single_to_multi_fast5", "pod5"):
+        (stub / tool).write_text("#!/bin/sh\nexec sleep 30\n")
+        (stub / tool).chmod(0o755)
+    _single_fast5(tmp_path / "run" / "r.fast5")
+    env = dict(os.environ, PATH=f"{stub}:{os.environ['PATH']}")
+    proc = subprocess.Popen(
+        ["nohup", sys.executable, str(Path(__file__).parent / "nanopore_converter.py"),
+         str(tmp_path / "run"), "--output-dir", str(tmp_path / "out")],
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=tmp_path)
+    try:
+        time.sleep(2)
+        proc.send_signal(signal.SIGHUP)
+        time.sleep(1)
+        assert proc.poll() is None, "converter died on SIGHUP under nohup"
+    finally:
+        proc.terminate()
+        proc.wait(timeout=20)

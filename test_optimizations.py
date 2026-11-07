@@ -1114,7 +1114,7 @@ def test_classify_chemistry_dorado_matrix(tmp_path: Path) -> None:
         (("FLO-MIN114", "SQK-LSK114-260", 4000),
          ("R10.4.1", "0.9.6", "dna_r10.4.1_e8.2_260bps_sup@v4.1.0")),
         (("FLO-MIN106", "SQK-LSK109", 4000), ("R9.4.1", "0.9.6", "dna_r9.4.1_e8_sup@v3.6")),
-        (("FLO-MIN106", "SQK-RNA002", 3000), ("R9.4.1", "0.9.6", "rna002_70bps_hac@v3")),
+        (("FLO-MIN106", "SQK-RNA002", 3000), ("RNA002", "0.9.6", "rna002_70bps_hac@v3")),
         (("FLO-MIN107", "SQK-LSK108", 4000), ("R9.5.1", None, None)),
         (("FLO-MIN004RA", "SQK-RNA004", 4000), ("RNA004", ">=1.0", None)),
         (("", "SQK-LSK110", 4000), ("R9.4.1", "0.9.6", "dna_r9.4.1_e8_sup@v3.6")),
@@ -1743,6 +1743,116 @@ def test_fast5_unknown_runs_get_a_skipped_comment(tmp_path: Path) -> None:
     print("  PASS: fast5_unknown SKIPPED comment")
 
 
+
+# ---------------------------------------------------------------------------
+# Audit round 4
+# ---------------------------------------------------------------------------
+
+def _make_pod5_file(path: Path, flowcell="FLO-MIN114", kit="SQK-LSK114", rate=5000) -> None:
+    import uuid
+    from datetime import datetime, timezone
+    import numpy as np
+    import pod5
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    info = pod5.RunInfo(
+        acquisition_id="acq", acquisition_start_time=now, adc_max=4095, adc_min=-4096,
+        context_tags={}, experiment_name="", flow_cell_id="F", flow_cell_product_code=flowcell,
+        protocol_name="", protocol_run_id="", protocol_start_time=now, sample_id="",
+        sample_rate=rate, sequencing_kit=kit, sequencer_position="",
+        sequencer_position_type="", software="", system_name="", system_type="", tracking_id={})
+    with pod5.Writer(path) as w:
+        w.add_read(pod5.Read(
+            read_id=uuid.uuid4(), pore=pod5.Pore(1, 1, "p"), calibration=pod5.Calibration(0.0, 1.0),
+            read_number=1, start_sample=0, median_before=200.0,
+            end_reason=pod5.EndReason.from_reason_with_default_forced(pod5.EndReasonEnum.SIGNAL_POSITIVE),
+            run_info=info, signal=np.zeros(10, dtype=np.int16)))
+
+
+def test_pod5_chemistry_survives_truncated_file(tmp_path: Path) -> None:
+    # Deterministic regardless of directory listing order: the only file at
+    # the top of pod5/ is truncated, the readable ones are in a subfolder.
+    run = tmp_path / "20240101_run_pod5trunc"
+    for name in ("a.pod5", "b.pod5"):
+        _make_pod5_file(run / "pod5" / "barcode01" / name)
+    good = (run / "pod5" / "barcode01" / "a.pod5").read_bytes()
+    (run / "pod5" / "truncated.pod5").write_bytes(good[:500])
+    result = analyze_run(run)
+    assert result["chemistry"] and result["chemistry"]["flowcell"] == "FLO-MIN114"
+    print("  PASS: pod5 chemistry survives a truncated file")
+
+
+def test_pod5_files_in_run_root(tmp_path: Path) -> None:
+    run = tmp_path / "20240101_run_flatpod5"
+    _make_pod5_file(run / "x0.pod5")
+    _make_pod5_file(run / "x1.pod5")
+    result = analyze_run(run)
+    assert result["formats"] == ["pod5"], result["formats"]
+    assert result["details"]["pod5"]["file_count"] == 2
+    assert result["chemistry_classification"]["pore"] == "R10.4.1"
+    print("  PASS: pod5 files in the run root")
+
+
+def test_archive_sizes_and_extraction_hints(tmp_path: Path) -> None:
+    from nanopore_format_checker import extraction_hint
+    run = tmp_path / "20240101_run_arc"
+    make_file(run / "reads.tar.gz", size=1234)
+    detail = analyze_run(run)["details"]["single_read_fast5"]
+    assert detail["data_size_bytes"] == 1234
+    hints = {n: extraction_hint(Path(n)).split()[0:2] for n in
+             ("a.zip", "a.tar.gz", "a.tbz2", "a.tar.xz", "a.tar", "a.gz")}
+    assert hints == {"a.zip": ["unzip", "'a.zip'"], "a.tar.gz": ["tar", "xzf"],
+                     "a.tbz2": ["tar", "xjf"], "a.tar.xz": ["tar", "xJf"],
+                     "a.tar": ["tar", "xf"], "a.gz": ["gunzip", "-k"]}
+    print("  PASS: archive sizes and extraction hints")
+
+
+def test_rna002_label_and_fast5_note_only_without_pod5(tmp_path: Path) -> None:
+    from nanopore_format_checker import dorado_advice_lines
+    rna = classify_chemistry({"flowcell": "FLO-MIN106", "kit": "SQK-RNA002", "sample_rate": 3012})
+    assert rna["pore"] == "RNA002" and rna["dorado_version"] == "0.9.6"
+    r10_4k = classify_chemistry({"flowcell": "FLO-MIN114", "kit": "SQK-LSK114", "sample_rate": 4000})
+    assert "fast5" not in (r10_4k["note"] or "")
+    assert "Automatic model selection needs pod5" not in "\n".join(dorado_advice_lines(r10_4k, ["pod5"]))
+    assert "Automatic model selection needs pod5" in "\n".join(dorado_advice_lines(r10_4k, ["multi_read_fast5"]))
+    print("  PASS: RNA002 label; fast5 note only without pod5")
+
+
+def test_uppercase_fast5_extension_is_counted(tmp_path: Path) -> None:
+    d = tmp_path / "f"
+    make_file(d / "a.FAST5", size=10)
+    make_file(d / "b.fast5", size=10)
+    assert fast_count_files(d, ".fast5")[0] == 2
+    assert estimate_dir_size(d, ".fast5")[0] == 2
+    print("  PASS: uppercase .FAST5 counted")
+
+
+def test_conversion_hints_create_the_output_folder(tmp_path: Path) -> None:
+    out = io.StringIO()
+    old = sys.stdout
+    sys.stdout = out
+    try:
+        print_conversion_help("multi_read_fast5")
+        print_conversion_help("single_read_fast5")
+    finally:
+        sys.stdout = old
+    for line in out.getvalue().splitlines():
+        if "pod5 convert fast5" in line:
+            assert "mkdir -p pod5_dir &&" in line, line
+    print("  PASS: conversion hints create the output folder")
+
+
+def test_single_fast5_root_layout_in_place_is_skipped(tmp_path: Path) -> None:
+    runs = {"20240101_root": {"formats": ["multi_read_fast5"], "run_path": "/d/20240101_root",
+                              "details": {"multi_read_fast5": {"directories": ["/d/20240101_root"]}}}}
+    script = generate_conversion_script(runs, "single_fast5")
+    assert "# SKIPPED 20240101_root: fast5 files are in the run folder itself" in script
+    assert "multi_to_single_fast5" not in script
+    script = generate_conversion_script(runs, "single_fast5", output_dir="/o")
+    assert "--save_path '/o/20240101_root/single_from_fast5/from__root'.partial" in script
+    print("  PASS: single_fast5 root layout in place is skipped")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -1850,6 +1960,13 @@ def main():
         test_glob_characters_in_paths,
         test_output_dir_inside_runs_is_refused,
         test_fast5_unknown_runs_get_a_skipped_comment,
+        test_pod5_chemistry_survives_truncated_file,
+        test_pod5_files_in_run_root,
+        test_archive_sizes_and_extraction_hints,
+        test_rna002_label_and_fast5_note_only_without_pod5,
+        test_uppercase_fast5_extension_is_counted,
+        test_conversion_hints_create_the_output_folder,
+        test_single_fast5_root_layout_in_place_is_skipped,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:

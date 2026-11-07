@@ -36,10 +36,10 @@ python nanopore_converter.py input_list.txt --output-dir /scratch/converted --th
 ### Tests
 
 ```bash
-python test_optimizations.py          # format checker tests (101 tests)
-python -m pytest test_nanopore_converter.py -v  # converter tests (58 tests)
-python -m pytest test_compress_folders.py -v    # archiver tests (15; two are skipped when run as root)
-python -m pytest test_integration.py -v         # real pod5/single_to_multi_fast5 end-to-end (6; skipped without the tools)
+python test_optimizations.py          # format checker tests (108 tests)
+python -m pytest test_nanopore_converter.py -v  # converter tests (62 tests)
+python -m pytest test_compress_folders.py -v    # archiver tests (18; two are skipped when run as root)
+python -m pytest test_integration.py -v         # real pod5/single_to_multi_fast5 end-to-end (8; skipped without the tools; one needs a non-root user)
 ```
 
 ### Format checker CLI flags
@@ -154,6 +154,10 @@ Output structure: `<output-dir>/<input_basename>/pod5/*.pod5`. A `pod5/` folder 
 - Never trust a conversion tool's exit code alone: `pod5 convert` and `single_to_multi_fast5` exit 0 after skipping files they cannot handle. Verify read counts (converter: `_verify_read_count`; scripts: embedded check)
 - `pod5 convert --output DIR/` writes a *file* named DIR if the folder does not exist; always create the output folder first
 - Hidden folders (starting with `.`) are work folders and never run data
+- A fast5 file counts as convertible only if the tools can convert it (`_inspect_fast5`): single-read needs read_id, Signal, channel_id and run_id; otherwise it is skipped as unreadable, because `single_to_multi_fast5` abandons its whole batch at such a file
+- Signal handlers must not override `SIG_IGN` (`nohup`)
+- Read IDs are stored as 16-byte keys (`_read_id_key`) and output IDs are streamed against them; memory scales with read count
+- Generated scripts fail a run on unreadable folders/files (permission), but only warn on corrupt files
 - Follow symlinked folders everywhere data is found, counted or verified (with a realpath loop guard): the conversion tools follow them, so any code that does not will disagree with them
 - Text written into generated bash comments goes through `_comment_safe()`; pod5 globs `[ ] * ?` in input paths, so scripts pass inputs through symlinks in a `mktemp -d` stage folder
 - `--convert-to single_fast5` output goes to `single_from_fast5/from__<path>`: never name output folders so they match detection patterns (`fast5*`, `pod5*`, `fastq*`) unless re-detection is intended (`pod5_from_fast5` is)
