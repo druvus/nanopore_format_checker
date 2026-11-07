@@ -36,7 +36,7 @@ python nanopore_converter.py input_list.txt --output-dir /scratch/converted --th
 ### Tests
 
 ```bash
-python test_optimizations.py          # format checker tests (93 tests)
+python test_optimizations.py          # format checker tests (94 tests)
 python -m pytest test_nanopore_converter.py -v  # converter tests (46 tests)
 python -m pytest test_compress_folders.py -v    # archiver tests (12; two are skipped when run as root)
 python -m pytest test_integration.py -v         # real pod5/single_to_multi_fast5 end-to-end (5; skipped without the tools)
@@ -165,5 +165,6 @@ Output structure: `<output-dir>/<input_basename>/pod5/*.pod5`. A `pod5/` folder 
 - Dorado support matrix (verified against the dorado changelog and `dorado/models/kits.cpp`): >=1.0 supports R10.4.1 5 kHz and RNA004 only, with POD5 input only (FAST5 removed in 1.0.0); 0.9.6 is the last release with R9.4.1 (4 kHz), R10.4.1 4 kHz (400 and 260 bps) and RNA002; no dorado release supports R10.3, R10.4 (Kit 12) or DNA on R9.5.1 (FLO-MIN107) -- those get `dorado_version = None` and a Guppy note
 - dorado's automatic model selection looks up (flowcell, kit, sample_rate) from pod5 RunInfo (case-insensitive) in its chemistry table; that is why conversion patches/fills these fields. Never invent a flowcell code that the source data does not contain
 - RNA002 has no sup model (`model_hint` is `hac`)
+- Verified with real dorado 0.9.6: a model *name* passed to `dorado basecaller` is treated as a folder path (download it first with `dorado download --model NAME`, run from the same folder); no dorado reads single-read fast5; 0.9.6 reads multi-read fast5 only with an explicit model; auto-selection on pod5 without a flowcell code aborts with `__UNKNOWN_FLOWCELL__`
 - `FLOWCELL_PORE` dict maps flowcell product codes to pore generations; update when new flowcells are released
 - `KIT_PORE` dict maps sequencing kit codes to pore types; used as fallback when flowcell code is absent
