@@ -10,7 +10,7 @@ Standalone Python CLI tools for Oxford Nanopore sequencing data:
 
 - **`nanopore_converter.py`** -- Converts fast5 files to pod5 format. Accepts a folder, compressed archive (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tar`, `.zip`), or a text file listing paths (one per line, mixed folders and archives). Handles the two-step single_read_fast5 conversion automatically (`single_to_multi_fast5` then `pod5 convert fast5`). Calls conversion tools as subprocesses.
 
-- **`compress_folders.py`** -- Archives each subfolder of an input directory into its own `.tar.gz` (copies existing archives, recompresses plain `.tar`), in parallel, with atomic writes and skip-if-exists re-runs. `_add_tree()` walks the tree itself instead of `tarfile.add()` so an unreadable file or subfolder is skipped and counted rather than failing the whole archive; an unlistable or untraversable top-level folder is an error (an empty archive would be skipped forever on re-runs). A top-level symlink is archived as its target's content; items sharing a destination archive are errors; the output dir is never archived into itself; Ctrl-C cancels queued items (`_STOP`); a hard link to a skipped file is stored as a regular file.
+- **`compress_folders.py`** -- Archives each subfolder of an input directory into its own `.tar.gz` (copies existing archives, recompresses plain `.tar`), in parallel, with atomic writes and skip-if-exists re-runs. `_add_tree()` walks the tree itself instead of `tarfile.add()` so an unreadable file or subfolder is skipped and counted rather than failing the whole archive; an unlistable or untraversable top-level folder is an error (an empty archive would be skipped forever on re-runs). A top-level symlink is archived as its target's content; items sharing a destination archive are errors; an existing archive is skipped only if its first entry is the folder's name (`_archive_top_folder`), otherwise it is an error; the output dir is never archived into itself; Ctrl-C cancels queued items (`_STOP`); a hard link to a skipped file is stored as a regular file.
 
 ## Running
 
@@ -36,9 +36,9 @@ python nanopore_converter.py input_list.txt --output-dir /scratch/converted --th
 ### Tests
 
 ```bash
-python test_optimizations.py          # format checker tests (108 tests)
-python -m pytest test_nanopore_converter.py -v  # converter tests (62 tests)
-python -m pytest test_compress_folders.py -v    # archiver tests (18; two are skipped when run as root)
+python test_optimizations.py          # format checker tests (109 tests)
+python -m pytest test_nanopore_converter.py -v  # converter tests (64 tests)
+python -m pytest test_compress_folders.py -v    # archiver tests (19; two are skipped when run as root)
 python -m pytest test_integration.py -v         # real pod5/single_to_multi_fast5 end-to-end (8; skipped without the tools; one needs a non-root user)
 ```
 
@@ -61,6 +61,7 @@ python -m pytest test_integration.py -v         # real pod5/single_to_multi_fast
 | `--output-dir DIR` | | Required. Base output directory for converted pod5 files |
 | `--threads N` | | Thread count for conversion tools (default: 4) |
 | `--force` | | Re-convert inputs that already have output (default: skip them) |
+| `--tmp-dir DIR` | | Where archives are extracted (default: hidden `.extract_*` folder in `--output-dir`) |
 | `--verbose` | `-v` | Enable detailed logging |
 
 ## Dependencies
@@ -117,10 +118,10 @@ The tool searches for format-specific subdirectories (`pod5/`, `pod5_pass/`, `fa
 
 Single script that orchestrates format conversion via subprocess calls. Key functions:
 
-- `parse_args()` - CLI argument parsing (input, --output-dir, --threads, --force, --verbose)
+- `parse_args()` - CLI argument parsing (input, --output-dir, --threads, --force, --tmp-dir, --verbose)
 - `check_tools()` - Verifies `single_to_multi_fast5` and `pod5` are on PATH; exits with code 2 if missing
 - `detect_input_type()` - Auto-detects whether input is a directory, archive (`.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz`, `.tar`, `.zip`), or list file (`.txt`, `.csv`, `.list`)
-- `extract_archive()` - Extracts compressed archives to a temp directory (tar uses the `data` extraction filter to block path traversal); caller handles cleanup
+- `extract_archive(path, parent)` - Extracts compressed archives to a new hidden `.extract_nanopore_conv_*` folder in `parent` (`process_item` passes `--tmp-dir` or the output dir; never the system temp folder, which is often small or RAM-backed) (tar uses the `data` extraction filter to block path traversal); caller handles cleanup
 - `parse_list_file()` - Reads a text file of paths (one per line, skips blanks and `#` comments)
 - `resolve_inputs()` - Resolves the input argument to a flat list of paths to process
 - `scan_fast5_dir()` - Opens every `.fast5` with h5py and groups it as single-read, multi-read or unreadable, collecting read IDs (duplicates of already-seen reads are skipped; partly overlapping multi-read files are `partial_duplicates`) and one sample file per `run_id`. Follows symlinked folders (loop guard), skips hidden folders / `._*` / `__MACOSX`, records unlistable folders in `unreadable_dirs` (the run then fails). `_verify_read_count()` checks the output's read IDs equal the input's, each once. `classify_fast5_dir()` summarises it (`mixed_fast5` possible)
@@ -168,6 +169,7 @@ Output structure: `<output-dir>/<input_basename>/pod5/*.pod5`. A `pod5/` folder 
 - Generated scripts single-quote every path via `_sh_quote()`; archive-only runs are emitted as `# SKIPPED` comments
 - `pod5 convert fast5` does not support single-read fast5 directly; conversion requires a two-step workflow: `single_to_multi_fast5` first, then `pod5 convert fast5`
 - Conversion scripts include pod5 metadata patching (via the pod5 Python API) when chemistry was detected from source fast5 files -- this corrects empty or incorrect metadata in converted pod5 files
+- Every h5py read of a data file goes through `_ISOLATED.call()` / `isolated()` (same code in both scripts): a forked worker with a per-file time limit (`FILE_TIMEOUT`, env `NANOPORE_FILE_TIMEOUT`, default 60 s), because some corrupt HDF5 files make the C library loop forever and no signal can interrupt that. On timeout the worker is killed and restarted; the file counts as unreadable. Functions passed must be module-level (they are pickled by name). Generated bash scripts have no such guard
 - Chemistry extraction is best-effort; failures never block format detection
 - Flowcell product codes are normalized to uppercase (fast5 stores them as lowercase bytes)
 - Dorado support matrix (verified against the dorado changelog and `dorado/models/kits.cpp`): >=1.0 supports R10.4.1 5 kHz and RNA004 only, with POD5 input only (FAST5 removed in 1.0.0); 0.9.6 is the last release with R9.4.1 (4 kHz), R10.4.1 4 kHz (400 and 260 bps) and RNA002; no dorado release supports R10.3, R10.4 (Kit 12) or DNA on R9.5.1 (FLO-MIN107) -- those get `dorado_version = None` and a Guppy note

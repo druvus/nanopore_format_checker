@@ -473,7 +473,7 @@ def test_rerun_skips_archive_without_extracting(tmp_path, monkeypatch):
     (out / "20240101_run" / "pod5" / "output.pod5").write_bytes(b"old")
     extracted = []
     monkeypatch.setattr("nanopore_converter.extract_archive",
-                        lambda p: extracted.append(p) or str(tmp_path))
+                        lambda p, *a: extracted.append(p) or str(tmp_path))
     assert main([str(archive), "--output-dir", str(out)]) == 0
     assert extracted == [] and tools.calls == []
 
@@ -933,3 +933,62 @@ def test_nohup_is_respected(tmp_path):
     finally:
         proc.terminate()
         proc.wait(timeout=20)
+
+
+_real_inspect = nanopore_converter._inspect_fast5
+
+
+def _inspect_or_hang(path):
+    """Stands in for the HDF5 library looping forever on a corrupt file."""
+    if Path(path).name == "hang.fast5":
+        import time
+        time.sleep(3600)
+    return _real_inspect(path)
+
+
+def test_hanging_fast5_is_skipped(tmp_path, monkeypatch):
+    """Regression: a corrupt fast5 that hangs h5py hung the whole conversion."""
+    import time
+    monkeypatch.setattr(nanopore_converter, "FILE_TIMEOUT", 1.0)
+    monkeypatch.setattr(nanopore_converter, "_inspect_fast5", _inspect_or_hang)
+    run = tmp_path / "run"
+    _single_fast5(run / "a.fast5")
+    _single_fast5(run / "hang.fast5")
+    _multi_fast5(run / "m.fast5", 2)
+    try:
+        start = time.monotonic()
+        scan = nanopore_converter.scan_fast5_dir(str(run))
+        assert time.monotonic() - start < 20
+        assert [p.name for p in scan.unreadable] == ["hang.fast5"]
+        assert scan.expected_reads == 3
+        # The worker was replaced: later calls work, errors give the default
+        assert nanopore_converter.isolated(len, "ab") == 2
+        assert nanopore_converter.isolated(int, "x", default=-1) == -1
+    finally:
+        nanopore_converter._ISOLATED.close()
+
+
+def test_archive_is_extracted_under_output_dir(tmp_path, monkeypatch):
+    """Archives are extracted next to the output, not in the system temp folder."""
+    from nanopore_converter import process_item
+    seen = []
+
+    def fake_convert(work_dir, *a, **kw):
+        seen.append(work_dir)
+        assert (Path(work_dir) / "test.fast5").is_file()
+        return True
+    monkeypatch.setattr("nanopore_converter.convert_run", fake_convert)
+    src = _single_fast5(tmp_path / "data" / "test.fast5")
+    archive = tmp_path / "data.tar.gz"
+    with _tarfile.open(archive, "w:gz") as tar:
+        tar.add(src, arcname="data/test.fast5")
+    out = tmp_path / "out"
+    assert process_item(str(archive), str(out)) is True
+    extract_dir = Path(seen[0]).parent
+    assert extract_dir.parent == out and extract_dir.name.startswith(".")
+    assert list(out.iterdir()) == []  # cleaned up
+    # --tmp-dir puts it elsewhere
+    scratch = tmp_path / "scratch"
+    assert process_item(str(archive), str(out), tmp_dir_parent=str(scratch)) is True
+    assert Path(seen[1]).parent.parent == scratch
+    assert list(scratch.iterdir()) == []

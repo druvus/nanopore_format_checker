@@ -345,3 +345,24 @@ def test_sigterm_cleans_up_like_ctrl_c(tmp_path):
     proc.send_signal(_signal.SIGTERM)
     assert proc.wait(timeout=30) == 130
     assert not [p for p in out.iterdir() if p.name.endswith(".tmp")]
+
+
+def test_unrelated_archive_with_same_name_is_not_skipped(tmp_path):
+    """Regression: with output = input, an unrelated run1.tar.gz counted as done."""
+    d = tmp_path / "d"
+    (d / "run1").mkdir(parents=True)
+    (d / "run1" / "a.txt").write_text("a")
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "x.txt").write_text("x")
+    with tarfile.open(d / "run1.tar.gz", "w:gz") as tar:
+        tar.add(other, arcname="other")
+    before = (d / "run1.tar.gz").read_bytes()
+    progress = _compress(d / "run1", d)
+    assert progress._errors == 1 and progress._skipped == 0
+    assert (d / "run1.tar.gz").read_bytes() == before  # never overwritten
+    # An archive made from the folder itself is still skipped on re-runs
+    (d / "run1.tar.gz").unlink()
+    assert _compress(d / "run1", d)._errors == 0
+    progress = _compress(d / "run1", d)
+    assert progress._skipped == 1 and progress._errors == 0

@@ -264,15 +264,36 @@ def _copy_with_stop(src: Path, dest: Path, chunk: int = 16 * 1024 * 1024) -> Non
     shutil.copystat(src, dest)
 
 
+def _archive_top_folder(archive: Path) -> str | None:
+    """Name of the first entry's top-level folder in a tar archive (archives
+    made by compress_directory start with '<folder>/'); None if unreadable.
+    Only the first header is read, so this is fast even for huge archives."""
+    try:
+        with tarfile.open(archive, "r:*") as tar:
+            first = tar.next()
+    except (tarfile.TarError, OSError, EOFError):
+        return None
+    return first.name.split("/", 1)[0] if first is not None else None
+
+
 def compress_directory(
     src: Path, dest_archive: Path, dry_run: bool, progress: ProgressTracker
 ) -> None:
     """Compress a directory into a .tar.gz archive, skipping unreadable files and directories."""
     name = src.name
     try:
-        # Check if output already exists (fast skip for re-runs)
+        # Skip for re-runs, but only if the existing archive was made from
+        # this folder: an unrelated run1.tar.gz next to run1/ (common when the
+        # output folder is the input folder) must not count as done.
         if dest_archive.exists():
-            progress.skip(name, "output exists")
+            top = _archive_top_folder(dest_archive)
+            if top == name:
+                progress.skip(name, "output exists")
+            else:
+                found = f"its top-level entry is {top!r}" if top else "it cannot be read"
+                log.error("  %s already exists but was not made from folder %s (%s); "
+                          "rename one of them", dest_archive.name, name, found)
+                progress.error(name)
             return
 
         if dry_run:

@@ -47,6 +47,84 @@ logger = logging.getLogger(__name__)
 SKIPPED_UNREADABLE: list[Path] = []
 
 
+# ---------------------------------------------------------------------------
+# Reading fast5/pod5 files in a worker process with a timeout
+# ---------------------------------------------------------------------------
+# Some corrupted HDF5 files make the HDF5 C library loop forever while
+# reading metadata. That loop cannot be interrupted from Python (signal
+# handlers never run), so file reads go to a forked worker process that is
+# killed and replaced when one file takes longer than FILE_TIMEOUT seconds.
+
+FILE_TIMEOUT = float(os.environ.get("NANOPORE_FILE_TIMEOUT", "60"))
+
+
+class FileTimeout(Exception):
+    """A file could not be read within FILE_TIMEOUT seconds (likely corrupt)."""
+
+
+def _isolated_worker(conn) -> None:
+    while True:
+        try:
+            func, args = conn.recv()
+        except (EOFError, OSError):
+            return
+        try:
+            conn.send((True, func(*args)))
+        except Exception as e:  # report, keep serving
+            conn.send((False, repr(e)))
+
+
+class _IsolatedCaller:
+    """Runs module-level functions in a long-lived forked worker process."""
+
+    def __init__(self):
+        self._proc = None
+        self._conn = None
+
+    def _start(self) -> None:
+        import multiprocessing
+        ctx = multiprocessing.get_context("fork")
+        self._conn, child = ctx.Pipe()
+        self._proc = ctx.Process(target=_isolated_worker, args=(child,), daemon=True)
+        self._proc.start()
+        child.close()
+
+    def call(self, func, *args, timeout: float | None = None):
+        """Return func(*args) computed in the worker. Raises FileTimeout if it
+        does not answer in time (the worker is then killed and replaced) and
+        RuntimeError if func raised."""
+        if self._proc is None or not self._proc.is_alive():
+            self._start()
+        self._conn.send((func, args))
+        if not self._conn.poll(FILE_TIMEOUT if timeout is None else timeout):
+            self.close()
+            raise FileTimeout(f"no answer within {FILE_TIMEOUT if timeout is None else timeout:g} s")
+        ok, value = self._conn.recv()
+        if not ok:
+            raise RuntimeError(value)
+        return value
+
+    def close(self) -> None:
+        if self._proc is not None:
+            self._proc.kill()
+            self._proc.join()
+            self._conn.close()
+        self._proc = self._conn = None
+
+
+_ISOLATED = _IsolatedCaller()
+
+
+def isolated(func, *args, default=None):
+    """func(*args) in the worker; `default` on timeout or error."""
+    try:
+        return _ISOLATED.call(func, *args)
+    except FileTimeout:
+        return default
+    except RuntimeError:
+        return default
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Convert nanopore fast5 files to pod5 format."
@@ -72,6 +150,12 @@ def parse_args(argv=None):
         help="Re-convert inputs whose output pod5/ folder already exists "
              "(default: skip them). The old output is replaced only after "
              "the new conversion succeeds.",
+    )
+    parser.add_argument(
+        "--tmp-dir",
+        help="Folder in which archives are extracted (default: a hidden "
+             ".extract_* folder inside --output-dir, removed afterwards). "
+             "Needs room for the largest extracted archive.",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -127,13 +211,20 @@ def detect_input_type(path_str: str) -> str | None:
     return None
 
 
-def extract_archive(archive_path: str) -> str:
-    """Extract a compressed archive to a temporary directory.
+def extract_archive(archive_path: str, parent: str | None = None) -> str:
+    """Extract a compressed archive to a new temporary directory in `parent`.
+
+    `parent` defaults to the system temp folder; process_item() passes the
+    output (or --tmp-dir) folder, because /tmp is often small or RAM-backed
+    and an extracted run can be hundreds of GB. The folder name starts with
+    "." so scans of the output folder never treat it as run data.
 
     Returns the path to the temporary directory. Caller is responsible for
     cleanup.
     """
-    tmp_dir = tempfile.mkdtemp(prefix="nanopore_conv_")
+    if parent is not None:
+        os.makedirs(parent, exist_ok=True)
+    tmp_dir = tempfile.mkdtemp(prefix=".extract_nanopore_conv_", dir=parent)
     p = Path(archive_path)
     name = p.name.lower()
 
@@ -373,7 +464,14 @@ def scan_fast5_dir(dir_path: str, exclude: list[str] | None = None) -> Fast5Scan
                     continue
                 (scan.single if size < 1_000_000 else scan.multi).append(fpath)
                 continue
-            info = _inspect_fast5(fpath)
+            try:
+                info = _ISOLATED.call(_inspect_fast5, fpath)
+            except FileTimeout:
+                logger.warning("Timed out reading %s after %g s (corrupt HDF5?); skipping it",
+                               fpath, FILE_TIMEOUT)
+                info = None
+            except RuntimeError:
+                info = None
             if info is None:
                 scan.unreadable.append(fpath)
                 continue
@@ -577,10 +675,7 @@ def _detect_chemistry(sample: Path | None) -> dict | None:
     except ImportError:
         logger.debug("nanopore_format_checker not importable; skipping metadata fill")
         return None
-    try:
-        return extract_chemistry_fast5(sample)
-    except Exception:
-        return None
+    return isolated(extract_chemistry_fast5, sample)
 
 
 class ConversionError(RuntimeError):
@@ -797,8 +892,12 @@ def _overlap_problem(item: str, run_out: str) -> str | None:
     return None
 
 
-def process_item(item_path: str, output_dir: str, threads: int = 4) -> bool:
+def process_item(item_path: str, output_dir: str, threads: int = 4,
+                 tmp_dir_parent: str | None = None) -> bool:
     """Process a single input item (directory or archive).
+
+    Archives are extracted into a hidden folder in `tmp_dir_parent`
+    (default: `output_dir`) and removed afterwards.
 
     Returns True on success, False on failure.
     """
@@ -807,7 +906,7 @@ def process_item(item_path: str, output_dir: str, threads: int = 4) -> bool:
 
     try:
         if item_type == "archive":
-            tmp_dir = extract_archive(item_path)
+            tmp_dir = extract_archive(item_path, tmp_dir_parent or output_dir)
             # The extracted archive may contain a single top-level folder
             # or files directly. Find the directory with fast5 files.
             work_dir = tmp_dir
@@ -923,7 +1022,8 @@ def main(argv=None):
             )
             skipped += 1
             continue
-        if process_item(item, args.output_dir, threads=args.threads):
+        if process_item(item, args.output_dir, threads=args.threads,
+                        tmp_dir_parent=args.tmp_dir):
             succeeded += 1
         else:
             failed += 1
