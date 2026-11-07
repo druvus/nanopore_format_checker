@@ -1770,10 +1770,13 @@ def _make_pod5_file(path: Path, flowcell="FLO-MIN114", kit="SQK-LSK114", rate=50
 
 
 def test_pod5_chemistry_survives_truncated_file(tmp_path: Path) -> None:
+    # Deterministic regardless of directory listing order: the only file at
+    # the top of pod5/ is truncated, the readable ones are in a subfolder.
     run = tmp_path / "20240101_run_pod5trunc"
     for name in ("a.pod5", "b.pod5"):
-        _make_pod5_file(run / "pod5" / name)
-    (run / "pod5" / "0_truncated.pod5").write_bytes((run / "pod5" / "a.pod5").read_bytes()[:500])
+        _make_pod5_file(run / "pod5" / "barcode01" / name)
+    good = (run / "pod5" / "barcode01" / "a.pod5").read_bytes()
+    (run / "pod5" / "truncated.pod5").write_bytes(good[:500])
     result = analyze_run(run)
     assert result["chemistry"] and result["chemistry"]["flowcell"] == "FLO-MIN114"
     print("  PASS: pod5 chemistry survives a truncated file")
