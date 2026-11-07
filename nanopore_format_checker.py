@@ -746,8 +746,12 @@ def classify_chemistry(chemistry: dict) -> dict:
     model_hint = "sup"
     explicit_model = None
     note = None
-    legacy_input = ("dorado 0.9.6 reads fast5, but automatic model selection "
-                    "needs pod5 input")
+    # Verified with dorado 0.9.6: it reads multi-read fast5 only, and only with
+    # an explicit model path; single-read fast5 fails ("Unable to open the
+    # group channel_id") and automatic model selection needs pod5.
+    legacy_input = ("automatic model selection needs pod5 input; dorado 0.9.6 reads "
+                    "multi-read fast5 only with an explicit model, and cannot read "
+                    "single-read fast5")
 
     if kit.startswith("SQK-RNA004") or pore == "RNA004":
         analyte = "rna"
@@ -802,7 +806,13 @@ def classify_chemistry(chemistry: dict) -> dict:
 
 
 def dorado_advice_lines(chem_class: dict, formats: list[str]) -> list[str]:
-    """Human-readable dorado recommendation for one run (verbose output)."""
+    """Human-readable dorado recommendation for one run (verbose output).
+
+    Checked against real dorado 0.9.6 runs: a model complex (fast/hac/sup)
+    is resolved from pod5 RunInfo only; an explicit model name is treated as
+    a folder path, so it must be downloaded first; single-read fast5 cannot
+    be read by any dorado version.
+    """
     lines = []
     ver = chem_class.get("dorado_version")
     note = chem_class.get("note")
@@ -810,19 +820,26 @@ def dorado_advice_lines(chem_class: dict, formats: list[str]) -> list[str]:
         if note:
             lines.append(f"dorado: {note}")
         return lines
-    has_fast5 = any(f in formats for f in
-                    ("single_read_fast5", "multi_read_fast5", "fast5_unknown"))
     has_pod5 = "pod5" in formats
     lines.append(f"dorado: use version {ver}")
     if note:
         lines.append(f"        {note}")
-    if ver == ">=1.0" and has_fast5 and not has_pod5:
+    if not has_pod5 and "single_read_fast5" in formats:
+        lines.append("        single-read fast5 cannot be read by dorado: convert to pod5 "
+                     "first (--convert-to pod5 or nanopore_converter.py)")
+    elif not has_pod5 and ver == ">=1.0" and any(
+            f in formats for f in ("multi_read_fast5", "fast5_unknown")):
         lines.append("        dorado >=1.0 cannot read fast5: convert to pod5 first "
                      "(--convert-to pod5 or nanopore_converter.py)")
     lines.append(f"model: dorado basecaller {chem_class['model_hint']} <pod5_dir>/ > calls.bam")
-    if chem_class.get("explicit_model"):
-        lines.append(f"       or, if auto-selection fails or input is fast5: "
-                     f"dorado basecaller {chem_class['explicit_model']} <input>/ > calls.bam")
+    model = chem_class.get("explicit_model")
+    if model:
+        # dorado treats a model *name* as a folder path, so download it first
+        # (into the current folder) and run basecaller from the same folder.
+        lines.append("       if auto-selection fails (missing flowcell/kit metadata), "
+                     "use the explicit model:")
+        lines.append(f"         dorado download --model {model}")
+        lines.append(f"         dorado basecaller {model} <pod5_dir>/ > calls.bam")
     return lines
 
 

@@ -184,7 +184,15 @@ Dorado 1.0 (May 2025) removed R9.4.1, R10.4.1 4 kHz and RNA002 models, **and rem
 How to basecall once you know the version:
 
 - **dorado >=1.0** needs POD5 input. Convert fast5 runs first (`--convert-to pod5` or `nanopore_converter.py`), then run `dorado basecaller sup pod5_dir/ > calls.bam`.
-- **dorado 0.9.6** still reads fast5, but automatic model selection (`dorado basecaller sup ...`) only works on POD5 whose RunInfo has a flowcell + kit pair and sample rate that dorado recognises. Otherwise pass the explicit model name from the table, e.g. `dorado basecaller dna_r9.4.1_e8_sup@v3.6 reads/ > calls.bam`. The conversion scripts' metadata patching exists to make auto-selection work for old runs whose fast5 lacks these fields.
+- **dorado 0.9.6**: automatic model selection (`dorado basecaller sup ...`) only works on POD5 whose RunInfo has a flowcell + kit pair and sample rate that dorado recognises; otherwise dorado stops with `No supported chemistry found for flowcell_code: '__UNKNOWN_FLOWCELL__'`. The conversion scripts' metadata patching and the converter's metadata fill exist to make auto-selection work for old runs whose fast5 lacks these fields. If a run has no flowcell code at all, use the explicit model from the table. dorado treats a model *name* as a folder path, so download it first and run basecaller from the same folder:
+
+  ```bash
+  dorado download --model dna_r9.4.1_e8_sup@v3.6
+  dorado basecaller dna_r9.4.1_e8_sup@v3.6 pod5_dir/ > calls.bam
+  ```
+- **fast5 input**: no dorado version reads single-read fast5, so convert it to pod5. dorado 0.9.6 reads multi-read fast5 only with an explicit model (as above); converting to pod5 is still recommended.
+
+These points were checked by running dorado 0.9.6 on converted test data: automatic selection worked for pod5 with full or filled-in metadata, failed for pod5 without a flowcell code (and for any fast5), and the two-step explicit-model command worked.
 - An R10.4.1 run whose sample rate could not be read is reported as `>=1.0` with a note to use 0.9.6 if it was sampled at 4 kHz. R9.4.1 runs at a rate other than 4 kHz (e.g. early 6 kHz PromethION) are flagged, as dorado's R9.4.1 model expects 4 kHz.
 
 `--verbose` prints this advice per run, and the TSV includes `dorado_version`, `dorado_model` and `dorado_note` columns.
@@ -205,7 +213,7 @@ Generated scripts handle:
 ## Tests
 
 ```bash
-# Format checker tests (93 tests)
+# Format checker tests (94 tests)
 python test_optimizations.py
 
 # Converter tests (46 tests)

@@ -1613,6 +1613,24 @@ def test_hidden_work_folders_are_not_run_data(tmp_path: Path) -> None:
     print("  PASS: hidden work folders ignored")
 
 
+
+def test_dorado_advice_is_runnable(tmp_path: Path) -> None:
+    """Advice verified against real dorado 0.9.6: explicit models must be
+    downloaded first, and single-read fast5 must be converted."""
+    from nanopore_format_checker import dorado_advice_lines
+    chem = classify_chemistry({"flowcell": "", "kit": "SQK-LSK108", "sample_rate": 4000})
+    lines = "\n".join(dorado_advice_lines(chem, ["single_read_fast5"]))
+    assert "dorado download --model dna_r9.4.1_e8_sup@v3.6" in lines
+    assert "dorado basecaller dna_r9.4.1_e8_sup@v3.6 <pod5_dir>/" in lines
+    assert "single-read fast5 cannot be read by dorado" in lines
+    lines = "\n".join(dorado_advice_lines(chem, ["pod5"]))
+    assert "convert to pod5" not in lines
+    r10 = classify_chemistry({"flowcell": "FLO-MIN114", "kit": "SQK-LSK114", "sample_rate": 5000})
+    lines = "\n".join(dorado_advice_lines(r10, ["multi_read_fast5"]))
+    assert "dorado >=1.0 cannot read fast5" in lines and "dorado download" not in lines
+    print("  PASS: dorado advice is runnable")
+
+
 def main():
     print("Running format detection tests...\n")
     passed = 0
@@ -1712,6 +1730,7 @@ def main():
         test_failed_run_block_actually_continues,
         test_single_fast5_outputs_per_input_folder,
         test_hidden_work_folders_are_not_run_data,
+        test_dorado_advice_is_runnable,
     ]
 
     with tempfile.TemporaryDirectory() as tmp:
